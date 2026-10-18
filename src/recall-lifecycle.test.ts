@@ -466,4 +466,44 @@ describe("automatic recall service lifecycle", () => {
     expect(recall).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledTimes(2);
   });
+
+  it("caches empty recall results for the same run key, isolates distinct run/bank keys, and clears cache on service restart", async () => {
+    const recall = vi
+      .spyOn(HindsightClient.prototype, "recall")
+      .mockResolvedValue({ results: [] } as never);
+
+    // 1. Cached empty result (undefined) is reused for the same run/bank key
+    const firstEmpty = await run();
+    expect(firstEmpty).toBeUndefined();
+    expect(recall).toHaveBeenCalledTimes(1);
+
+    const secondEmpty = await run();
+    expect(secondEmpty).toBeUndefined();
+    expect(recall).toHaveBeenCalledTimes(1);
+
+    // 2. Separate runId triggers a fresh recall
+    recall.mockResolvedValueOnce(memory as never);
+    const otherRunResult = await hooks.get("before_prompt_build")!(event, {
+      ...ctx,
+      runId: "other-run",
+    });
+    expect(otherRunResult).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("A fixture observation"),
+      }),
+    );
+    expect(recall).toHaveBeenCalledTimes(2);
+
+    // 3. Service restart clears the completed recall cache
+    await service.stop();
+    await service.start();
+    recall.mockResolvedValueOnce(memory as never);
+    const afterRestartResult = await run();
+    expect(afterRestartResult).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("A fixture observation"),
+      }),
+    );
+    expect(recall).toHaveBeenCalledTimes(3);
+  });
 });
