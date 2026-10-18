@@ -3774,4 +3774,88 @@ describe("filterInternalAndOperationalTurns boundaries", () => {
       ]),
     ).toEqual([]);
   });
+
+  it("treats OpenClaw continuation and retry prompts as operational for recall while stripping them without splitting user turns on retain", () => {
+    const continuationPrompts = [
+      "Continue the current task from the existing transcript, preserving completed work. Do not repeat status text that was already sent to the user.",
+      "The session context was compacted during this turn, and the previous reply only acknowledged starting the work. Continue from the current transcript and complete the user's request now (run the needed tools or provide the actual result). Do not repeat the acknowledgment.",
+      "A final-turn hook rejected the previous draft reply before delivery.\n\nReason: missing citation",
+      "The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not repeat completed work.",
+      "The previous attempt did not produce a user-visible answer. Continue from the current session state and produce the visible answer now. Do not repeat completed work.",
+      "The previous assistant turn stopped for tool use but contained no tool call, so nothing ran. Either emit the needed tool call now or provide a user-visible answer from the current state. Do not repeat completed work.",
+      "The previous assistant turn completed its tool calls but did not produce a user-visible answer. Use the tool results already in the transcript and produce the visible answer now. Do not repeat completed tool calls unless new information is required.",
+    ];
+
+    for (const promptText of continuationPrompts) {
+      expect(isEphemeralOperationalText(promptText)).toBe(true);
+      expect(extractRecallQuery(promptText, promptText)).toBeNull();
+      expect(isUserTurnInitiator({ role: "user", content: promptText })).toBe(
+        false,
+      );
+    }
+
+    expect(
+      isEphemeralOperationalText(
+        "System Alert: The Gateway service has just restarted.",
+      ),
+    ).toBe(true);
+    expect(
+      isEphemeralOperationalText(
+        "The conversation history before this point was compacted into the following summary:\n\nSummary text",
+      ),
+    ).toBe(true);
+    expect(
+      isEphemeralOperationalText(
+        "The following is a summary of a branch that this conversation came back from:\n\nBranch summary",
+      ),
+    ).toBe(true);
+
+    // Simulate a turn where auto-compaction injected CONTINUATION_PROMPT mid-turn
+    const realUser = {
+      role: "user",
+      content:
+        "Please summarize today's deployment status and save preferences.",
+    };
+    const preCompactionAssistant = {
+      role: "assistant",
+      content: "Checking the deployment status now.",
+    };
+    const syntheticContinuation = {
+      role: "user",
+      content:
+        "Continue the current task from the existing transcript, preserving completed work. Do not repeat status text that was already sent to the user.",
+    };
+    const postCompactionAssistant = {
+      role: "assistant",
+      content: "All deployments succeeded and preferences are saved.",
+    };
+
+    const retained = prepareRetentionTranscript(
+      [
+        realUser,
+        preCompactionAssistant,
+        syntheticContinuation,
+        postCompactionAssistant,
+      ],
+      { retainFormat: "json", retainToolCalls: false },
+      false,
+    );
+    expect(retained).not.toBeNull();
+    const parsed = JSON.parse(retained!.transcript);
+    expect(parsed).toEqual([
+      {
+        role: "user",
+        content:
+          "Please summarize today's deployment status and save preferences.",
+      },
+      {
+        role: "assistant",
+        content: "Checking the deployment status now.",
+      },
+      {
+        role: "assistant",
+        content: "All deployments succeeded and preferences are saved.",
+      },
+    ]);
+  });
 });

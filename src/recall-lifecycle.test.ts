@@ -427,4 +427,43 @@ describe("automatic recall service lifecycle", () => {
     expect(result).toBeUndefined();
     expect(recall).not.toHaveBeenCalled();
   });
+
+  it("skips recall and progress emission on post-compaction continuation retry prompt", async () => {
+    const recall = vi.spyOn(HindsightClient.prototype, "recall");
+    const continuationEvent = {
+      currentUserMessage:
+        "Continue the current task from the existing transcript, preserving completed work. Do not repeat status text that was already sent to the user.",
+      prompt:
+        "Continue the current task from the existing transcript, preserving completed work. Do not repeat status text that was already sent to the user.",
+      messages: [],
+    };
+    const result = await hooks.get("before_prompt_build")!(
+      continuationEvent,
+      ctx,
+    );
+    expect(result).toBeUndefined();
+    expect(recall).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("reuses completed recall result across sequential retry attempts with the same runId without calling recall again", async () => {
+    const recall = vi
+      .spyOn(HindsightClient.prototype, "recall")
+      .mockResolvedValue(memory as never);
+
+    const firstAttempt = await run();
+    expect(firstAttempt).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("A fixture observation"),
+      }),
+    );
+    expect(recall).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(2);
+
+    // Simulate Attempt 2 of the same runId (e.g., preflight context overflow retry)
+    const secondAttempt = await run();
+    expect(secondAttempt).toEqual(firstAttempt);
+    expect(recall).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(2);
+  });
 });
