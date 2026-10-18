@@ -427,4 +427,83 @@ describe("automatic recall service lifecycle", () => {
     expect(result).toBeUndefined();
     expect(recall).not.toHaveBeenCalled();
   });
+
+  it("skips recall and progress emission on post-compaction continuation retry prompt", async () => {
+    const recall = vi.spyOn(HindsightClient.prototype, "recall");
+    const continuationEvent = {
+      currentUserMessage:
+        "Continue the current task from the existing transcript, preserving completed work. Do not repeat status text that was already sent to the user.",
+      prompt:
+        "Continue the current task from the existing transcript, preserving completed work. Do not repeat status text that was already sent to the user.",
+      messages: [],
+    };
+    const result = await hooks.get("before_prompt_build")!(
+      continuationEvent,
+      ctx,
+    );
+    expect(result).toBeUndefined();
+    expect(recall).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("reuses completed recall result across sequential retry attempts with the same runId without calling recall again", async () => {
+    const recall = vi
+      .spyOn(HindsightClient.prototype, "recall")
+      .mockResolvedValue(memory as never);
+
+    const firstAttempt = await run();
+    expect(firstAttempt).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("A fixture observation"),
+      }),
+    );
+    expect(recall).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(2);
+
+    // Simulate Attempt 2 of the same runId (e.g., preflight context overflow retry)
+    const secondAttempt = await run();
+    expect(secondAttempt).toEqual(firstAttempt);
+    expect(recall).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(2);
+  });
+
+  it("caches empty recall results for the same run key, isolates distinct run/bank keys, and clears cache on service restart", async () => {
+    const recall = vi
+      .spyOn(HindsightClient.prototype, "recall")
+      .mockResolvedValue({ results: [] } as never);
+
+    // 1. Cached empty result (undefined) is reused for the same run/bank key
+    const firstEmpty = await run();
+    expect(firstEmpty).toBeUndefined();
+    expect(recall).toHaveBeenCalledTimes(1);
+
+    const secondEmpty = await run();
+    expect(secondEmpty).toBeUndefined();
+    expect(recall).toHaveBeenCalledTimes(1);
+
+    // 2. Separate runId triggers a fresh recall
+    recall.mockResolvedValueOnce(memory as never);
+    const otherRunResult = await hooks.get("before_prompt_build")!(event, {
+      ...ctx,
+      runId: "other-run",
+    });
+    expect(otherRunResult).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("A fixture observation"),
+      }),
+    );
+    expect(recall).toHaveBeenCalledTimes(2);
+
+    // 3. Service restart clears the completed recall cache
+    await service.stop();
+    await service.start();
+    recall.mockResolvedValueOnce(memory as never);
+    const afterRestartResult = await run();
+    expect(afterRestartResult).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("A fixture observation"),
+      }),
+    );
+    expect(recall).toHaveBeenCalledTimes(3);
+  });
 });

@@ -284,6 +284,12 @@ const banksWithDefaultsApplied = new Set<string>();
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
+type CachedRecallPromptResult = {
+  prependContext?: string;
+  prependSystemContext?: string;
+  appendSystemContext?: string;
+} | null;
+const recallResultByRunId = new Map<string, CachedRecallPromptResult>();
 
 // Bank-scoped recall handle created by getClientForContext(). Retention is
 // delivered separately by the durable outbox worker.
@@ -1441,7 +1447,10 @@ export function composeRecallQuery(
       if (!content) {
         return null;
       }
-      if (role === "user" && content === latest) {
+      if (
+        role === "user" &&
+        (content === latest || isEphemeralOperationalText(content))
+      ) {
         return null;
       }
       return `${role}: ${content}`;
@@ -1926,9 +1935,46 @@ const OPERATIONAL_TEXT_PATTERNS: readonly RegExp[] = [
   /^All pending descendants for that run have now settled/i,
   /^Child completion results:/i,
   /^\[Inter-session message\]/i,
+  /^System Alert: The Gateway service has just restarted\./i,
+  /^The conversation history before this point was compacted into the following summary:/i,
+  /^The following is a summary of a branch that this conversation came back from:/i,
+];
+
+// OpenClaw internal in-turn continuation / recovery retry prompts injected
+// when an embedded attempt retries after auto-compaction or incomplete output.
+// These must not trigger memory recall and must not split or suppress the
+// surrounding user turn during retention.
+const CONTINUATION_RETRY_TEXT_PATTERNS: readonly RegExp[] = [
+  /^Continue the current task from the existing transcript, preserving completed work\./i,
+  /^The session context was compacted during this turn, and the previous reply only acknowledged starting the work\./i,
+  /^A final-turn hook rejected the previous draft reply before delivery\./i,
+  /^The previous assistant turn recorded reasoning but did not produce a user-visible answer\./i,
+  /^The previous attempt did not produce a user-visible answer\./i,
+  /^The previous assistant turn stopped for tool use but contained no tool call, so nothing ran\./i,
+  /^The previous assistant turn completed its tool calls but did not produce a user-visible answer\./i,
 ];
 
 const INTERNAL_CONTEXT_MARKER_RE = /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i;
+
+export function isContinuationRetryPromptText(
+  text: string | undefined,
+): boolean {
+  if (!text || typeof text !== "string") return false;
+
+  let normalized = text
+    .replace(/\[role:\s*[^\]]+\]\s*/gi, "")
+    .replace(/\[[a-z]+:end\]\s*/gi, "")
+    .trim();
+
+  if (INTERNAL_CONTEXT_MARKER_RE.test(normalized)) {
+    normalized = stripInternalRuntimeContext(normalized).trim();
+  }
+  if (!normalized) return false;
+
+  return CONTINUATION_RETRY_TEXT_PATTERNS.some((pattern) =>
+    pattern.test(normalized),
+  );
+}
 
 export function isEphemeralOperationalText(text: string | undefined): boolean {
   if (!text || typeof text !== "string") return false;
@@ -1946,7 +1992,10 @@ export function isEphemeralOperationalText(text: string | undefined): boolean {
     if (!normalized) return true;
   }
 
-  return OPERATIONAL_TEXT_PATTERNS.some((pattern) => pattern.test(normalized));
+  return (
+    OPERATIONAL_TEXT_PATTERNS.some((pattern) => pattern.test(normalized)) ||
+    CONTINUATION_RETRY_TEXT_PATTERNS.some((pattern) => pattern.test(normalized))
+  );
 }
 
 /**
@@ -2000,13 +2049,33 @@ function extractMessageText(content: OpenClawMessage["content"]): string {
 }
 
 /**
+ * Check whether a message is a synthetic OpenClaw mid-turn continuation/retry
+ * prompt injected during compaction or incomplete-turn recovery.
+ */
+export function isContinuationRetryPromptMessage(
+  msg: OpenClawMessage | null | undefined,
+): boolean {
+  if (!msg || typeof msg !== "object" || msg.role !== "user") return false;
+  const rawText = extractMessageText(msg.content);
+  const cleaned = stripRuntimeEnvelope(
+    stripInlineTimestampPrefix(
+      stripMetadataEnvelopes(rawText.replace(/^(?:System:.*\n)+\n?/, "")),
+    ),
+  ).trim();
+  if (!cleaned) return false;
+  return isContinuationRetryPromptText(cleaned);
+}
+
+/**
  * Determine whether a message initiates an actual user turn (as opposed to
- * synthetic messages like tool results normalized into role:"user").
+ * synthetic messages like tool results or mid-turn continuation prompts
+ * normalized into role:"user").
  */
 export function isUserTurnInitiator(
   msg: OpenClawMessage | null | undefined,
 ): boolean {
   if (!msg || msg.role !== "user") return false;
+  if (isContinuationRetryPromptMessage(msg)) return false;
   const content = msg.content;
   if (typeof content === "string") return true;
   if (Array.isArray(content)) {
@@ -2104,6 +2173,9 @@ export function filterInternalAndOperationalTurns<T extends OpenClawMessage>(
   let skipTurn = false;
   let hasGenuineUser = false;
   for (const msg of messages) {
+    if (isContinuationRetryPromptMessage(msg)) {
+      continue;
+    }
     if (isUserTurnInitiator(msg)) {
       skipTurn = isInternalOrOperationalTurnMessage(msg);
       if (!skipTurn) hasGenuineUser = true;
@@ -2984,6 +3056,7 @@ function registerPlugin(api: OpenClawPluginApi) {
         preServiceHookController.abort();
         serviceAbortController?.abort();
         inflightRecalls.clear();
+        recallResultByRunId.clear();
         const serviceController = new AbortController();
         serviceAbortController = serviceController;
         const startGeneration = ++serviceGeneration;
@@ -3155,6 +3228,7 @@ function registerPlugin(api: OpenClawPluginApi) {
           serviceAbortController?.abort();
           serviceAbortController = null;
           inflightRecalls.clear();
+          recallResultByRunId.clear();
           debug("[Hindsight] Service stopping...");
 
           // Only stop daemon if in local mode
@@ -3419,6 +3493,17 @@ function registerPlugin(api: OpenClawPluginApi) {
           );
           return;
         }
+        const runRecallCacheKey =
+          typeof ctx?.runId === "string" && ctx.runId.trim().length > 0
+            ? `${ctx.runId.trim()}::${bankId}`
+            : undefined;
+        if (runRecallCacheKey && recallResultByRunId.has(runRecallCacheKey)) {
+          const cachedRunResult = recallResultByRunId.get(runRecallCacheKey);
+          debug(
+            `[Hindsight] Reusing cached recall result for runId ${ctx?.runId} (bank: ${bankId})`,
+          );
+          return cachedRunResult ?? undefined;
+        }
         debug(
           `[Hindsight] extractRecallQuery result length: ${extracted.length}`,
         );
@@ -3580,6 +3665,9 @@ function registerPlugin(api: OpenClawPluginApi) {
           : 0;
 
         if (!response.results || response.results.length === 0) {
+          if (runRecallCacheKey) {
+            setCappedMapValue(recallResultByRunId, runRecallCacheKey, null);
+          }
           finishRecall({ state: "completed", resultCount: 0 });
           if (pluginConfig.debugPerfTiming) {
             log.info(
@@ -3644,15 +3732,20 @@ ${memoriesFormatted}
         // need system-level memory context can still opt into prepend or append.
         finishRecall({ state: "completed", resultCount: results.length });
         const position = pluginConfig.recallInjectionPosition ?? "user";
-        switch (position) {
-          case "append":
-            return { appendSystemContext: contextMessage };
-          case "user":
-            return { prependContext: contextMessage };
-          case "prepend":
-          default:
-            return { prependSystemContext: contextMessage };
+        const injectionResult: Exclude<CachedRecallPromptResult, null> =
+          position === "append"
+            ? { appendSystemContext: contextMessage }
+            : position === "user"
+              ? { prependContext: contextMessage }
+              : { prependSystemContext: contextMessage };
+        if (runRecallCacheKey) {
+          setCappedMapValue(
+            recallResultByRunId,
+            runRecallCacheKey,
+            injectionResult,
+          );
         }
+        return injectionResult;
       } catch (error) {
         if (!isCurrentRecall()) {
           cancelRecall();
