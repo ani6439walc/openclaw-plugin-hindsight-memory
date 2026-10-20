@@ -3371,13 +3371,16 @@ function registerPlugin(api: OpenClawPluginApi) {
       // the early-return paths below don't influence the measurement of slow
       // recall calls — perf lines are only emitted on the recall path.
       const perfHookStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
-      let finishRecall: (terminal: {
+      let finishHindsightMemoryRecall: (terminal: {
         state: "completed" | "failed" | "cancelled" | "skipped";
         resultCount?: number;
         reason?: "timeout" | "error" | "service_stopped" | "client_unavailable";
       }) => void = () => {};
-      const cancelRecall = () =>
-        finishRecall({ state: "cancelled", reason: "service_stopped" });
+      const cancelHindsightMemoryRecall = () =>
+        finishHindsightMemoryRecall({
+          state: "cancelled",
+          reason: "service_stopped",
+        });
       try {
         // Check if this is an inter-session / subagent completion internal event
         if (isInterSessionInternalEvent(ctx)) {
@@ -3538,10 +3541,12 @@ function registerPlugin(api: OpenClawPluginApi) {
         }
 
         // Progress is best-effort telemetry, never a dependency of memory recall.
-        const recallId = randomUUID();
-        const progressStart = Date.now();
-        let progressFinished = false;
-        const emitProgress = (details: Record<string, unknown>) => {
+        const hindsightMemoryRecallId = randomUUID();
+        const hindsightMemoryProgressStart = Date.now();
+        let hindsightMemoryProgressFinished = false;
+        const emitHindsightMemoryProgress = (
+          details: Record<string, unknown>,
+        ) => {
           try {
             if (!ctx?.runId) return;
             ctx.hookInvocation?.assertActive();
@@ -3550,9 +3555,9 @@ function registerPlugin(api: OpenClawPluginApi) {
               stream: "plugin:hindsight-memory",
               sessionKey: sessionKeyForCache,
               data: {
-                kind: "hindsight.recall",
+                kind: "hindsight-memory.recall",
                 pluginId: "hindsight-memory",
-                recallId,
+                recallId: hindsightMemoryRecallId,
                 ...(sessionKeyForCache === undefined
                   ? {}
                   : { sessionKey: sessionKeyForCache }),
@@ -3564,27 +3569,34 @@ function registerPlugin(api: OpenClawPluginApi) {
             // Failed subscribers must not interrupt recall.
           }
         };
-        finishRecall = (terminal) => {
-          if (progressFinished) return;
-          progressFinished = true;
-          emitProgress({
+        finishHindsightMemoryRecall = (terminal) => {
+          if (hindsightMemoryProgressFinished) return;
+          hindsightMemoryProgressFinished = true;
+          emitHindsightMemoryProgress({
             ...terminal,
-            durationMs: Math.max(0, Date.now() - progressStart),
+            durationMs: Math.max(0, Date.now() - hindsightMemoryProgressStart),
           });
         };
-        emitProgress({ state: "started" });
-        recallController?.signal.addEventListener("abort", cancelRecall, {
-          once: true,
-        });
+        emitHindsightMemoryProgress({ state: "started" });
+        recallController?.signal.addEventListener(
+          "abort",
+          cancelHindsightMemoryRecall,
+          {
+            once: true,
+          },
+        );
         if (!isCurrentRecall()) {
-          cancelRecall();
+          cancelHindsightMemoryRecall();
           return;
         }
 
         // Wait for client to be ready
         const clientGlobal = (global as any).__hindsightClient;
         if (!clientGlobal) {
-          finishRecall({ state: "skipped", reason: "client_unavailable" });
+          finishHindsightMemoryRecall({
+            state: "skipped",
+            reason: "client_unavailable",
+          });
           debug(
             "[Hindsight] Client global not available, skipping auto-recall",
           );
@@ -3593,7 +3605,7 @@ function registerPlugin(api: OpenClawPluginApi) {
 
         await clientGlobal.waitForReady();
         if (!isCurrentRecall()) {
-          cancelRecall();
+          cancelHindsightMemoryRecall();
           return;
         }
 
@@ -3601,11 +3613,14 @@ function registerPlugin(api: OpenClawPluginApi) {
         const client =
           await clientGlobal.getClientForContext(resolvedCtxForRecall);
         if (!isCurrentRecall()) {
-          cancelRecall();
+          cancelHindsightMemoryRecall();
           return;
         }
         if (!client) {
-          finishRecall({ state: "skipped", reason: "client_unavailable" });
+          finishHindsightMemoryRecall({
+            state: "skipped",
+            reason: "client_unavailable",
+          });
           debug("[Hindsight] Client not initialized, skipping auto-recall");
           return;
         }
@@ -3657,7 +3672,7 @@ function registerPlugin(api: OpenClawPluginApi) {
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
         const response = await recallPromise;
         if (!isCurrentRecall()) {
-          cancelRecall();
+          cancelHindsightMemoryRecall();
           return;
         }
         const recallElapsedMs = pluginConfig.debugPerfTiming
@@ -3668,7 +3683,7 @@ function registerPlugin(api: OpenClawPluginApi) {
           if (runRecallCacheKey) {
             setCappedMapValue(recallResultByRunId, runRecallCacheKey, null);
           }
-          finishRecall({ state: "completed", resultCount: 0 });
+          finishHindsightMemoryRecall({ state: "completed", resultCount: 0 });
           if (pluginConfig.debugPerfTiming) {
             log.info(
               formatHookPerf(
@@ -3730,7 +3745,10 @@ ${memoriesFormatted}
         // Keep recalled memories outside the system prompt by default so the
         // provider can reuse its stable prompt prefix across turns. Users who
         // need system-level memory context can still opt into prepend or append.
-        finishRecall({ state: "completed", resultCount: results.length });
+        finishHindsightMemoryRecall({
+          state: "completed",
+          resultCount: results.length,
+        });
         const position = pluginConfig.recallInjectionPosition ?? "user";
         const injectionResult: Exclude<CachedRecallPromptResult, null> =
           position === "append"
@@ -3748,9 +3766,9 @@ ${memoriesFormatted}
         return injectionResult;
       } catch (error) {
         if (!isCurrentRecall()) {
-          cancelRecall();
+          cancelHindsightMemoryRecall();
         } else {
-          finishRecall({
+          finishHindsightMemoryRecall({
             state: "failed",
             reason:
               error instanceof DOMException && error.name === "TimeoutError"
@@ -3782,7 +3800,10 @@ ${memoriesFormatted}
         }
         return;
       } finally {
-        recallController?.signal.removeEventListener("abort", cancelRecall);
+        recallController?.signal.removeEventListener(
+          "abort",
+          cancelHindsightMemoryRecall,
+        );
       }
     });
 

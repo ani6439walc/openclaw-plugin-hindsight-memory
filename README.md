@@ -90,7 +90,7 @@ The `data` payload contains:
 
 | Field         | Meaning                                                                                                          |
 | ------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `kind`        | Always `hindsight.recall`.                                                                                       |
+| `kind`        | Always `hindsight-memory.recall`.                                                                                |
 | `pluginId`    | Plugin ID (`hindsight-memory`).                                                                                  |
 | `recallId`    | A unique ID for each hook invocation that starts recall.                                                         |
 | `sessionKey`  | Session routing key, when available.                                                                             |

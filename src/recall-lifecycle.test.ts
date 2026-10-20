@@ -162,7 +162,7 @@ describe("automatic recall service lifecycle", () => {
       sessionKey: ctx.sessionKey,
       stream: "plugin:hindsight-memory",
       data: {
-        kind: "hindsight.recall",
+        kind: "hindsight-memory.recall",
         pluginId: "hindsight-memory",
         recallId: expect.any(String),
         sessionKey: ctx.sessionKey,
