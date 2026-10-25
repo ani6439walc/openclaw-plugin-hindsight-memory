@@ -20,10 +20,8 @@ import {
 import { emitAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { RetainQueue } from "./retain-queue.js";
-import {
-  compileSessionPatterns,
-  matchesSessionPattern,
-} from "./session-patterns.js";
+import { compileSessionPatterns } from "./session-patterns.js";
+import { normalizeMemoryScope, shouldSkipSession } from "./session-scope.js";
 import {
   definePluginEntry,
   type AnyAgentTool,
@@ -1719,13 +1717,11 @@ export function resolveAndCacheIdentity(
   const baseCtx =
     options.ctx ||
     (sessionKey ? ({ sessionKey } as PluginHookAgentContext) : undefined);
-  // "main" is the synthetic provider produced by parseSessionKey for default
-  // `agent:<id>:main` sessions — the *real* dispatch surface (telegram,
-  // webchat, qqbot, …) is whatever the dispatcher provides. Treat it as if
-  // the session key carried no provider so the dispatchChannel flows through
-  // as the effective surface for downstream identity resolution. (#1541)
+  // Main and operational namespaces do not name the live dispatch surface.
+  // Prefer the actual context/cache/dispatch provider over these fallbacks.
   const sessionProvider =
-    parsedSession.provider && parsedSession.provider !== "main"
+    parsedSession.provider &&
+    !["main", "cron", "heartbeat", "subagent"].includes(parsedSession.provider)
       ? parsedSession.provider
       : undefined;
   const effectiveCtx =
@@ -1851,12 +1847,6 @@ export function getIdentitySkipReason(
   const allowCliSessions = agentBanking || staticBanking || mappedBanking;
 
   if (typeof sessionKey === "string") {
-    if (/^agent:[^:]+:(cron|heartbeat|subagent):/.test(sessionKey)) {
-      return {
-        resolvedCtx,
-        reason: finalSkipReason(`operational session ${sessionKey}`),
-      };
-    }
     if (!allowCliSessions && /^agent:[^:]+:main$/.test(sessionKey)) {
       return {
         resolvedCtx,
@@ -1871,13 +1861,7 @@ export function getIdentitySkipReason(
     }
   }
 
-  const operationalProviders = allowCliSessions
-    ? ["cron", "heartbeat", "subagent"]
-    : ["cron", "heartbeat", "subagent", "main"];
-  if (
-    resolvedCtx?.messageProvider &&
-    operationalProviders.includes(resolvedCtx.messageProvider)
-  ) {
+  if (!allowCliSessions && resolvedCtx?.messageProvider === "main") {
     return {
       resolvedCtx,
       reason: finalSkipReason(
@@ -2829,6 +2813,24 @@ export function getPluginConfig(
 ): PluginConfig {
   const config = (api.pluginConfig ?? {}) as PluginConfig;
 
+  const removedSetting = [
+    "enableTools",
+    "enableKnowledgeTools",
+    "autoRecall",
+    "autoRetain",
+    "excludeProviders",
+    "ignoreSessionPatterns",
+    "statelessSessionPatterns",
+    "skipStatelessSessions",
+    "operationalSessionPolicy",
+  ].find((key) => Object.hasOwn(config, key));
+  if (removedSetting) {
+    throw new Error(
+      `${removedSetting} has been removed. Tools are always enabled; migrate automatic memory exclusions to scope.skipRecallSessions and scope.skipRetainSessions. Provider exclusions require an explicit session-pattern migration.`,
+    );
+  }
+  const scope = normalizeMemoryScope(config.scope);
+
   const senderPrefixPattern =
     typeof config.senderPrefixPattern === "string" &&
     config.senderPrefixPattern.trim().length > 0
@@ -2841,6 +2843,7 @@ export function getPluginConfig(
   // does not stamp anything. This lets per-bank missions written via the API
   // (PATCH /banks/{id}) survive gateway restarts. (#1270)
   return {
+    scope,
     bankMission:
       typeof config.bankMission === "string" && config.bankMission.length > 0
         ? config.bankMission
@@ -2905,21 +2908,9 @@ export function getPluginConfig(
       config.retainContext.trim().length > 0
         ? config.retainContext.trim()
         : DEFAULT_RETAIN_CONTEXT,
-    excludeProviders: Array.isArray(config.excludeProviders)
-      ? Array.from(
-          new Set([
-            "heartbeat",
-            ...config.excludeProviders.filter(
-              (provider): provider is string => typeof provider === "string",
-            ),
-          ]),
-        )
-      : ["heartbeat"],
-    autoRecall: config.autoRecall !== false, // Default: true (on) — backward compatible
     dynamicBankGranularity: Array.isArray(config.dynamicBankGranularity)
       ? config.dynamicBankGranularity
       : DEFAULT_DYNAMIC_BANK_GRANULARITY,
-    autoRetain: config.autoRetain !== false, // Default: true
     retainRoles: Array.isArray(config.retainRoles)
       ? config.retainRoles
       : undefined,
@@ -2972,13 +2963,6 @@ export function getPluginConfig(
       config.recallTimeoutMs >= 1000
         ? config.recallTimeoutMs
         : undefined,
-    ignoreSessionPatterns: Array.isArray(config.ignoreSessionPatterns)
-      ? config.ignoreSessionPatterns
-      : [],
-    statelessSessionPatterns: Array.isArray(config.statelessSessionPatterns)
-      ? config.statelessSessionPatterns
-      : [],
-    skipStatelessSessions: config.skipStatelessSessions !== false,
     debug: config.debug ?? false,
     debugPerfTiming: config.debugPerfTiming === true,
     // Retain queue: kept off the strict whitelist before — user values were
@@ -2997,11 +2981,6 @@ export function getPluginConfig(
       config.retainQueueFlushIntervalMs > 0
         ? config.retainQueueFlushIntervalMs
         : undefined,
-    enableTools:
-      config.enableTools === false ||
-      (config as Record<string, unknown>).enableKnowledgeTools === false
-        ? false
-        : true,
     senderPrefixPattern,
   };
 }
@@ -3019,13 +2998,20 @@ function registerPlugin(api: OpenClawPluginApi) {
     );
     return;
   }
-  _registeredApis.add(api);
   try {
     log.info("plugin entry invoked");
     debug("[Hindsight] Plugin loading...");
 
     // Get plugin config first (needed for debug flag and service registration)
     const pluginConfig = getPluginConfig(api);
+    const skipRecallPatterns = compileSessionPatterns(
+      pluginConfig.scope?.skipRecallSessions ?? [],
+    );
+    const skipRetainPatterns = compileSessionPatterns(
+      pluginConfig.scope?.skipRetainSessions ?? [],
+    );
+    // Invalid config must not mark the API as registered and prevent a retry.
+    _registeredApis.add(api);
     // If logLevel is 'debug', also enable legacy debug flag
     debugEnabled = pluginConfig.debug ?? pluginConfig.logLevel === "debug";
 
@@ -3145,9 +3131,7 @@ function registerPlugin(api: OpenClawPluginApi) {
             );
             const mode = usingExternalApi ? "external API" : "local daemon";
             if (!wasInitialized) {
-              log.info(
-                `initialized (mode: ${mode}, bank: ${defaultBankId}, autoRecall: ${pluginConfig.autoRecall !== false}, autoRetain: ${pluginConfig.autoRetain !== false})`,
-              );
+              log.info(`initialized (mode: ${mode}, bank: ${defaultBankId})`);
             }
             debug(`[Hindsight] ✓ Ready (${mode})`);
           } catch (error) {
@@ -3390,56 +3374,15 @@ function registerPlugin(api: OpenClawPluginApi) {
           return;
         }
 
-        // Check if this provider is excluded
-        if (
-          ctx?.messageProvider &&
-          pluginConfig.excludeProviders?.includes(ctx.messageProvider)
-        ) {
-          debug(
-            `[Hindsight] Skipping recall for excluded provider: ${ctx.messageProvider}`,
-          );
-          return;
-        }
-
-        // Session pattern filtering
         const sessionKey = ctx?.sessionKey;
-        if (sessionKey) {
-          const ignorePatterns = compileSessionPatterns(
-            pluginConfig.ignoreSessionPatterns ?? [],
+        if (shouldSkipSession(sessionKey, skipRecallPatterns)) {
+          debug(
+            `[Hindsight] Skipping recall: scope.skipRecallSessions excludes session '${sessionKey ?? "<missing>"}'`,
           );
-          if (
-            ignorePatterns.length > 0 &&
-            matchesSessionPattern(sessionKey, ignorePatterns)
-          ) {
-            debug(
-              `[Hindsight] Skipping recall: session '${sessionKey}' matches ignoreSessionPatterns`,
-            );
-            return;
-          }
-          const skipStateless = pluginConfig.skipStatelessSessions !== false;
-          if (skipStateless) {
-            const statelessPatterns = compileSessionPatterns(
-              pluginConfig.statelessSessionPatterns ?? [],
-            );
-            if (
-              statelessPatterns.length > 0 &&
-              matchesSessionPattern(sessionKey, statelessPatterns)
-            ) {
-              debug(
-                `[Hindsight] Skipping recall: session '${sessionKey}' matches statelessSessionPatterns (skipStatelessSessions=true)`,
-              );
-              return;
-            }
-          }
-        }
-
-        // Skip auto-recall when disabled (agent has its own recall tool)
-        if (!pluginConfig.autoRecall) {
-          debug("[Hindsight] Auto-recall disabled via config, skipping");
           return;
         }
 
-        const sessionKeyForCache = ctx.sessionKey;
+        const sessionKeyForCache = ctx?.sessionKey;
         const skipTurnReason = sessionKeyForCache
           ? skipHindsightTurnBySession.get(sessionKeyForCache)
           : undefined;
@@ -3525,7 +3468,9 @@ function registerPlugin(api: OpenClawPluginApi) {
         const recallRoles = pluginConfig.recallRoles ?? ["user", "assistant"];
         const composedPrompt = composeRecallQuery(
           extracted,
-          sessionMessages,
+          filterInternalAndOperationalTurns(
+            sessionMessages as OpenClawMessage[],
+          ),
           recallContextTurns,
           recallRoles,
         );
@@ -3848,17 +3793,6 @@ ${memoriesFormatted}
             ? ({ sessionKey: eventSessionKey } as PluginHookAgentContext)
             : undefined);
 
-        // Check if this provider is excluded
-        if (
-          effectiveCtx?.messageProvider &&
-          pluginConfig.excludeProviders?.includes(effectiveCtx.messageProvider)
-        ) {
-          debug(
-            `[Hindsight] Skipping retain for excluded provider: ${effectiveCtx.messageProvider}`,
-          );
-          return;
-        }
-
         // Check if this is an inter-session / subagent completion internal event
         if (isInterSessionInternalEvent(effectiveCtx)) {
           debug(
@@ -3867,33 +3801,12 @@ ${memoriesFormatted}
           return;
         }
 
-        // Session pattern filtering
         const agentEndSessionKey = effectiveCtx?.sessionKey;
-        if (agentEndSessionKey) {
-          const ignorePatterns = compileSessionPatterns(
-            pluginConfig.ignoreSessionPatterns ?? [],
+        if (shouldSkipSession(agentEndSessionKey, skipRetainPatterns)) {
+          debug(
+            `[Hindsight] Skipping retain: scope.skipRetainSessions excludes session '${agentEndSessionKey ?? "<missing>"}'`,
           );
-          if (
-            ignorePatterns.length > 0 &&
-            matchesSessionPattern(agentEndSessionKey, ignorePatterns)
-          ) {
-            debug(
-              `[Hindsight] Skipping retain: session '${agentEndSessionKey}' matches ignoreSessionPatterns`,
-            );
-            return;
-          }
-          const statelessPatterns = compileSessionPatterns(
-            pluginConfig.statelessSessionPatterns ?? [],
-          );
-          if (
-            statelessPatterns.length > 0 &&
-            matchesSessionPattern(agentEndSessionKey, statelessPatterns)
-          ) {
-            debug(
-              `[Hindsight] Skipping retain: session '${agentEndSessionKey}' matches statelessSessionPatterns`,
-            );
-            return;
-          }
+          return;
         }
 
         const sessionKeyForLookup = effectiveCtx?.sessionKey;
@@ -3945,8 +3858,6 @@ ${memoriesFormatted}
           debug("[Hindsight Hook] Agent run failed, skipping retention");
           return;
         }
-
-        if (pluginConfig.autoRetain === false) return;
 
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
         const sessionKey = effectiveCtx?.sessionKey ?? "session";
@@ -4195,8 +4106,8 @@ ${memoriesFormatted}
     debug("[Hindsight] Hooks registered");
     log.info("agent hooks registered");
 
-    // Register knowledge tools (enabled by default via enableTools config flag)
-    if (pluginConfig.enableTools && typeof api.registerTool === "function") {
+    // Register explicit tools independently of automatic memory scope.
+    if (typeof api.registerTool === "function") {
       try {
         const apiUrl = (() => {
           const ext = detectExternalApi(pluginConfig);

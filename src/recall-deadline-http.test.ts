@@ -82,8 +82,7 @@ beforeEach(async () => {
       hindsightApiUrl: baseUrl,
       bankId: "test-bank",
       dynamicBankId: false,
-      autoRecall: true,
-      autoRetain: false,
+      scope: { skipRetainSessions: ["**"] },
       // 1000 is the floor: getPluginConfig drops anything lower, and the
       // hook then falls back to the 10s default — which blows this test's
       // budget rather than exercising the deadline.

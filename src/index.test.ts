@@ -2205,12 +2205,10 @@ describe("session identity helpers", () => {
     "agent:worker:cron:nightly:cleanup",
     "agent:worker:heartbeat:node-1",
     "agent:worker:subagent:abc123",
-  ])("marks operational sessions as final skips: %s", (sessionKey) => {
+  ])("allows operational sessions by default: %s", (sessionKey) => {
     const result = getIdentitySkipReason({ sessionKey });
-    expect(result.reason).toEqual({
-      kind: "final",
-      detail: `operational session ${sessionKey}`,
-    });
+    expect(result.reason).toBeUndefined();
+    expect(result.resolvedCtx?.senderId).toBe("agent-user:worker");
   });
 
   it("marks temp sessions as final skips", () => {
@@ -2272,15 +2270,12 @@ describe("session identity helpers", () => {
     expect(result.reason).toBeUndefined();
   });
 
-  it("still skips cron/heartbeat/subagent providers when agent banking is enabled", () => {
+  it("allows cron sessions when agent banking is enabled", () => {
     const result = getIdentitySkipReason(
       { sessionKey: "agent:main:cron:nightly:cleanup" },
       { dynamicBankGranularity: ["agent"] },
     );
-    expect(result.reason).toEqual({
-      kind: "final",
-      detail: "operational session agent:main:cron:nightly:cleanup",
-    });
+    expect(result.reason).toBeUndefined();
   });
 
   it("synthesizes sender identity for anonymous CLI sessions when agent banking is enabled", () => {
@@ -2470,6 +2465,27 @@ describe("session identity helpers", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveAndCacheIdentity dispatch-surface gate (#1541)", () => {
+  it.each(["cron", "heartbeat", "subagent"])(
+    "uses the live Discord provider for a %s namespace with channel banking",
+    (type) => {
+      const sessionKey = `agent:research:${type}:live-dispatch`;
+      const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
+        sessionKey,
+        ctx: { sessionKey, senderId: "researcher", channelId: "research-room" },
+        dispatchChannel: "discord",
+        pluginConfig: {
+          dynamicBankGranularity: ["provider", "channel", "user"],
+        },
+      });
+      expect(skipReason).toBeUndefined();
+      expect(resolvedCtx?.messageProvider).toBe("discord");
+      expect(
+        deriveBankId(resolvedCtx, {
+          dynamicBankGranularity: ["provider", "channel", "user"],
+        }),
+      ).toBe("discord::research-room::researcher");
+    },
+  );
   it("does not skip when session provider is synthetic 'main' (telegram dispatch)", () => {
     const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
       sessionKey: "agent:bug1541-tg:main",
@@ -2586,21 +2602,28 @@ describe("resolveAndCacheIdentity dispatch-surface gate (#1541)", () => {
     });
   });
 
-  it("still skips operational sessions for a mapped agent", () => {
-    // The map widens allowCliSessions; cron/heartbeat/subagent and temp:
-    // sessions return before that is consulted and must stay skipped.
-    for (const sessionKey of [
-      "agent:inbound:cron:job-1",
-      "temp:inbound:scratch",
-    ]) {
+  it.each(["cron", "heartbeat", "subagent"])(
+    "allows mapped %s sessions",
+    (type) => {
+      const sessionKey = `agent:inbound:${type}:job-1`;
       const { skipReason } = resolveAndCacheIdentity({
         sessionKey,
         ctx: { sessionKey, agentId: "inbound" },
         pluginConfig: { agentBankMap: { inbound: "ps-technology" } },
       });
 
-      expect(skipReason?.kind).toBe("final");
-    }
+      expect(skipReason).toBeUndefined();
+    },
+  );
+
+  it("still skips ephemeral temp sessions for a mapped agent", () => {
+    const sessionKey = "temp:inbound:scratch";
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey,
+      ctx: { sessionKey, agentId: "inbound" },
+      pluginConfig: { agentBankMap: { inbound: "ps-technology" } },
+    });
+    expect(skipReason?.kind).toBe("final");
   });
 });
 
@@ -2899,33 +2922,61 @@ describe("defaultRetainQueuePath", () => {
   });
 });
 
-describe("getPluginConfig — enableTools whitelist", () => {
-  it("defaults to true when not set", () => {
-    expect(getPluginConfig(makeApi({})).enableTools).toBe(true);
+describe("getPluginConfig — automatic memory scope", () => {
+  it.each([
+    {},
+    { scope: {} },
+    { scope: { skipRecallSessions: [], skipRetainSessions: [] } },
+  ])("defaults to no scope exclusions: %j", (config) => {
+    expect(getPluginConfig(makeApi(config)).scope).toEqual({
+      skipRecallSessions: [],
+      skipRetainSessions: [],
+    });
   });
 
-  it("passes enableTools=true through when set", () => {
-    const cfg = getPluginConfig(makeApi({ enableTools: true }));
-    expect(cfg.enableTools).toBe(true);
+  it("preserves independent recall and retain patterns", () => {
+    const scope = {
+      skipRecallSessions: ["agent:*:cron:**"],
+      skipRetainSessions: ["agent:librarian:subagent:**", "**:review:**"],
+    };
+    expect(getPluginConfig(makeApi({ scope })).scope).toEqual(scope);
   });
 
-  it("passes enableTools=false through when set", () => {
-    expect(getPluginConfig(makeApi({ enableTools: false })).enableTools).toBe(
+  it.each(
+    [
+      null,
       false,
-    );
-  });
+      [],
+      "all",
+      { agents: [] },
+      { skipRecallSessions: null },
+      { skipRecallSessions: "**" },
+      { skipRecallSessions: [false] },
+      { skipRecallSessions: [""] },
+      { skipRetainSessions: {} },
+      { skipRetainSessions: [1] },
+    ].map((scope) => ({ scope })),
+  )(
+    "rejects invalid scope rather than dropping exclusions: %j",
+    ({ scope }) => {
+      expect(() => getPluginConfig(makeApi({ scope }))).toThrow(/scope/);
+    },
+  );
 
-  it("defaults to true when set to a non-boolean truthy value", () => {
-    expect(getPluginConfig(makeApi({ enableTools: "true" })).enableTools).toBe(
-      true,
+  it.each([
+    "enableTools",
+    "enableKnowledgeTools",
+    "autoRecall",
+    "autoRetain",
+    "excludeProviders",
+    "ignoreSessionPatterns",
+    "statelessSessionPatterns",
+    "skipStatelessSessions",
+    "operationalSessionPolicy",
+  ])("requires explicit migration of removed setting %s", (key) => {
+    expect(() => getPluginConfig(makeApi({ [key]: false }))).toThrow(
+      new RegExp(key),
     );
-    expect(getPluginConfig(makeApi({ enableTools: 1 })).enableTools).toBe(true);
-  });
-
-  it("honors legacy enableKnowledgeTools=false fallback", () => {
-    expect(
-      getPluginConfig(makeApi({ enableKnowledgeTools: false })).enableTools,
-    ).toBe(false);
   });
 });
 

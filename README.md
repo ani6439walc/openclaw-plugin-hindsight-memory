@@ -185,9 +185,8 @@ Optional settings in `~/.openclaw/openclaw.json` under `plugins.entries.hindsigh
 | `retainContext`            | built-in OpenClaw guidance     | Interpretation guidance sent through the Hindsight retain API `context` field. The default tells the extraction LLM that sender/channel/provider metadata, bank IDs, session keys, source systems, and tags are operational routing metadata, not human names, project names, or organizations.                  |
 | `senderPrefixPattern`      | —                              | Regex matching a human display-name prefix some channels prepend to user text (e.g. `Alice: today weather?`). Give the name part only (`Alice\|Bob`, `[A-Za-z ]{1,20}`) — the `:` and anchoring are added. Strips it from recall queries and retained transcripts. Unset strips nothing; invalid regex ignored.  |
 | `dynamicBankGranularity`   | `["agent", "channel", "user"]` | Fields used to derive bank ID. Options: `agent`, `channel`, `user`, `provider`                                                                                                                                                                                                                                   |
-| `excludeProviders`         | `["heartbeat"]`                | Message providers to skip for recall/retain (e.g. `heartbeat`, `slack`, `telegram`, `discord`)                                                                                                                                                                                                                   |
-| `autoRecall`               | `true`                         | Auto-inject memories before each turn. Set to `false` when the agent has its own recall tool.                                                                                                                                                                                                                    |
-| `autoRetain`               | `true`                         | Auto-retain conversations after each turn                                                                                                                                                                                                                                                                        |
+| `scope.skipRecallSessions` | `[]`                           | Session-key globs that skip automatic recall. `["**"]` disables it globally; explicit tools are unaffected.                                                                                                                                                                                                      |
+| `scope.skipRetainSessions` | `[]`                           | Session-key globs that skip automatic retention, including session-end tail retention. `["**"]` disables it globally; explicit tools are unaffected.                                                                                                                                                             |
 | `retainRoles`              | `["user", "assistant"]`        | Which message roles to retain. Options: `user`, `assistant`, `system`, `tool`                                                                                                                                                                                                                                    |
 | `retainFormat`             | `"json"`                       | Serialization format for retained conversation content. `"json"` emits a structured array of `{role, content}` messages (matches Claude Code). `"text"` emits legacy `[role: x] … [x:end]` markers.                                                                                                              |
 | `retainToolCalls`          | `true`                         | With `retainFormat: "json"`, each message's content is an Anthropic-shaped block array (`text` / `tool_use` / `tool_result`). Tool results are truncated at 2000 chars. Hindsight's own MCP tools (recall/retain/search/…) are filtered to prevent feedback loops. Set `false` to retain text-only content.      |
@@ -207,11 +206,7 @@ Optional settings in `~/.openclaw/openclaw.json` under `plugins.entries.hindsigh
 | `recallInjectionPosition`  | `"user"`                       | Where to inject recalled memories: `user` places them before the user message and preserves the system prompt cache; `prepend` and `append` place them at the start or end of the system prompt.                                                                                                                 |
 | `hindsightApiUrl`          | —                              | External Hindsight API URL (skips local daemon)                                                                                                                                                                                                                                                                  |
 | `hindsightApiToken`        | —                              | Auth token for external API. **Sensitive** — set via `openclaw config set ... --ref-source env --ref-id HINDSIGHT_API_TOKEN`.                                                                                                                                                                                    |
-| `ignoreSessionPatterns`    | `[]`                           | Session key glob patterns to skip entirely — no recall, no retain (e.g. `["agent:*:cron:**"]`)                                                                                                                                                                                                                   |
-| `statelessSessionPatterns` | `[]`                           | Session key glob patterns for read-only sessions — retain is always skipped; recall is skipped when `skipStatelessSessions` is `true` (e.g. `["agent:*:subagent:**", "agent:*:heartbeat:**"]`)                                                                                                                   |
-| `skipStatelessSessions`    | `true`                         | When `true`, sessions matching `statelessSessionPatterns` also skip recall. Set to `false` to allow recall but still skip retain.                                                                                                                                                                                |
 | `debugPerfTiming`          | `false`                        | Emit one info-level perf line per `before_prompt_build` (recall path) and `agent_end` (retain path) so you can spot whether latency is in the plugin or upstream. Off by default. Format: `perf: <hook> hook_total=Xms <hook-specific fields>`. Safe in production — uses the existing logger.                   |
-| `enableTools`              | `true`                         | Register knowledge and memory tools (`memory_recall`, `memory_reflect`, `memory_store`, `knowledge_page`) for explicit agent-driven lookup, reflection, storage, and knowledge-page management. Default: true.                                                                                                   |
 
 ### Per-agent bank mapping
 
@@ -237,7 +232,7 @@ Details worth knowing:
 - **Retain, recall and the knowledge tools all follow the map** — they resolve the bank through the same path.
 - **Bank defaults still apply.** A mapped bank is stamped with the configured missions, extraction mode, entity labels and so on when it is first used, exactly like a derived bank.
 - **Agent ids match exactly** — the lookup is case-sensitive and not fuzzy, so `Inbound` is not `inbound`. Keys are trimmed, values too.
-- **Mapped agents are exempt from the sender/surface skips.** A session whose sender cannot be resolved, or whose dispatch surface differs from the session's provider, is normally skipped rather than routed into a bank keyed by the wrong thing. A mapped agent's bank depends on neither, so those sessions are retained as intended. Operational sessions (`cron`, `heartbeat`, `subagent`, `temp:`) are still skipped for mapped agents, exactly as before.
+- **Mapped agents are exempt from the sender/surface skips.** A session whose sender cannot be resolved, or whose dispatch surface differs from the session's provider, is normally skipped rather than routed into a bank keyed by the wrong thing. A mapped agent's bank depends on neither, so those sessions are retained as intended. Cron, heartbeat and subagent sessions are eligible unless excluded by `scope`; `temp:` sessions and internal coordination messages remain excluded.
 - **Entries with a blank or non-string bank are ignored** (and logged), rather than routing an agent to a bank named `""`.
 
 ### Per-user dynamic bank defaults
@@ -268,43 +263,63 @@ Unset options are not sent — existing behaviour is unchanged when you only con
 
 ### Manual Knowledge Tools
 
-When `enableTools` is enabled (default: `true`), the plugin registers explicit knowledge & memory tools in addition to automatic recall (`memory_recall`, `memory_reflect`, `memory_store`, `knowledge_page`). Use `knowledge_page` to manage consolidated knowledge pages/mental models (`action: "list" | "get" | "create" | "update" | "delete"`). Use `memory_recall` for ordinary memory lookup. Use `memory_reflect` only for deliberate synthesis, retrospectives, or long-term preference/pattern questions; it retrieves memories and then calls the configured Reflect LLM to generate an answer. Use `memory_store` to upload documents or raw knowledge directly into the memory bank.
+The plugin always registers explicit knowledge & memory tools when the host supports tool registration (`memory_recall`, `memory_reflect`, `memory_store`, `knowledge_page`). The automatic-memory `scope` does not restrict these tools or change their bank routing. Use `knowledge_page` to manage consolidated knowledge pages/mental models (`action: "list" | "get" | "create" | "update" | "delete"`). Use `memory_recall` for ordinary memory lookup. Use `memory_reflect` only for deliberate synthesis, retrospectives, or long-term preference/pattern questions; it retrieves memories and then calls the configured Reflect LLM to generate an answer. Use `memory_store` to upload documents or raw knowledge directly into the memory bank.
 
 Knowledge tools resolve the same dynamic memory bank as auto-recall and auto-retain: the plugin runs the shared identity-resolution path (`resolveAndCacheIdentity`) from the tool session context before deriving the bank ID. With user-scoped dynamic banking (`dynamicBankGranularity` includes `"user"`), tools target the per-user bank for that session; if sender identity cannot be resolved, tool execution returns a clear error instead of querying the shared `openclaw` default or an `anonymous` fallback bank. Configured bank defaults (missions, extraction mode, entity labels, etc.) are applied on first knowledge-tool use, matching `getClientForContext` behavior.
 
 `memory_reflect` uses conservative defaults: `budget: "low"`, `max_tokens: 1024`, and `fact_types: ["world", "experience", "observation"]`. Production deployments should also set a finite bank-level `reflect_source_facts_max_tokens` value, such as `4096` or `8192`, rather than leaving reflection source facts unlimited.
 
-### Session pattern filtering
+### Automatic memory scope
 
-`ignoreSessionPatterns` and `statelessSessionPatterns` accept glob patterns matched against the session key (format: `agent:<agentId>:<type>:<uuid>`).
+Automatic recall and retention are enabled by default for all session types, including cron, subagent and heartbeat. Use `scope.skipRecallSessions` and `scope.skipRetainSessions` to exclude sessions independently. No providers or session types are added to either list automatically. Internal coordination messages, ephemeral `temp:` sessions and invalid bank identities are still filtered.
+
+Both options accept glob patterns matched against the entire session key, such as `agent:<agentId>:cron:<jobId>:run:<sessionId>`. Session keys describe the session namespace; they do not necessarily contain the actual message provider.
 
 Glob syntax:
 
 - `*` — matches any characters except `:` (single segment)
 - `**` — matches anything including `:` (multiple segments)
+- A session is skipped when any pattern matches. There is no negation or allow-override syntax.
 
-| Pattern               | Matches                             |
-| --------------------- | ----------------------------------- |
-| `agent:*:cron:**`     | All cron sessions for any agent     |
-| `agent:*:subagent:**` | All subagent sessions for any agent |
-| `agent:main:**`       | All sessions under the `main` agent |
+| Pattern               | Matches                                              |
+| --------------------- | ---------------------------------------------------- |
+| `agent:*:cron:**`     | All cron sessions for any agent                      |
+| `agent:*:subagent:**` | All subagent sessions for any agent                  |
+| `agent:main:**`       | All sessions under the `main` agent                  |
+| `**`                  | All sessions, including events without a session key |
 
-**Difference between the two options:**
+Omitting `scope`, using `{}`, or omitting either list leaves that action without scope exclusions. An empty list `[]` also imposes no scope exclusions. If a list contains patterns but the event has no session key, that action is skipped because the exclusion rules cannot be evaluated. A malformed scope, unknown scope field, non-string pattern or empty pattern string is a configuration error.
 
-|        | `ignoreSessionPatterns` | `statelessSessionPatterns`                      |
-| ------ | ----------------------- | ----------------------------------------------- |
-| Retain | Skipped                 | Always skipped                                  |
-| Recall | Skipped                 | Skipped only when `skipStatelessSessions: true` |
-
-**Example config** — exclude cron jobs from memory entirely, allow subagents to read but not write memories:
+**Example config** — exclude cron jobs from automatic memory entirely, allow subagents to recall but not retain:
 
 ```json
 {
-  "ignoreSessionPatterns": ["agent:*:cron:**"],
-  "statelessSessionPatterns": ["agent:*:subagent:**"],
-  "skipStatelessSessions": false
+  "scope": {
+    "skipRecallSessions": ["agent:*:cron:**"],
+    "skipRetainSessions": ["agent:*:cron:**", "agent:*:subagent:**"]
+  }
 }
 ```
+
+To disable an automatic action globally, set its list to `["**"]`. To disable both, set both lists to `["**"]`. The explicit memory and knowledge tools remain available.
+
+### Migrating previous memory controls
+
+This is a breaking configuration change. Remove the old fields from plugin config before loading this version; the strict configuration schema rejects them. There are no compatibility aliases.
+
+| Removed setting                          | Replacement                                                                                                                                                                                   |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `autoRecall: false`                      | Add `"**"` to `scope.skipRecallSessions`.                                                                                                                                                     |
+| `autoRetain: false`                      | Add `"**"` to `scope.skipRetainSessions`.                                                                                                                                                     |
+| `autoRecall: true` / `autoRetain: true`  | Remove the setting; automatic memory is enabled by default.                                                                                                                                   |
+| `ignoreSessionPatterns`                  | Copy its patterns into both skip lists.                                                                                                                                                       |
+| `statelessSessionPatterns`               | Copy its patterns into `skipRetainSessions`; also copy them into `skipRecallSessions` if `skipStatelessSessions` was omitted or `true`.                                                       |
+| `skipStatelessSessions`                  | Remove after migrating the stateless patterns; `false` meant recall remained allowed.                                                                                                         |
+| `enableTools` / `enableKnowledgeTools`   | Remove; explicit tools are always registered when supported by the host. Disabling tools through plugin config is no longer supported.                                                        |
+| `excludeProviders`                       | Remove; provider-wide exclusions have no lossless session-glob equivalent because provider and session namespace can differ. Choose exclusions from the actual session keys you want to skip. |
+| `operationalSessionPolicy` (unpublished) | Remove; cron/subagent sessions are now eligible by default. Use the skip lists for sessions that should remain excluded.                                                                      |
+
+Merge migrated patterns with any patterns already in the corresponding list. Existing cron, subagent and heartbeat sessions become eligible unless excluded by the new scope. To retain the old cron/subagent namespace exclusions, add `agent:*:cron:**` and `agent:*:subagent:**` to both lists. Heartbeat can also use an ordinary session key; only a dedicated heartbeat namespace can be excluded with `agent:*:heartbeat:**`. Session patterns cannot distinguish heartbeat from other runs sharing the same key.
 
 ### Durable conversation retention
 

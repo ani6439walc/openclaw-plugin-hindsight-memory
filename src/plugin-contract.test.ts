@@ -93,12 +93,10 @@ describe("official OpenClaw plugin contracts", () => {
         hindsightApiUrl: "https://hindsight.test",
         dynamicBankId: false,
         bankId: "contract-bank",
-        autoRecall: false,
-        autoRetain: true,
+        scope: { skipRecallSessions: ["**"] },
         retainEveryNTurns: 3,
         retainQueuePath: queuePath,
         logLevel: "off",
-        enableTools: false,
         ...config,
       },
       registerService(registered) {
@@ -167,14 +165,14 @@ describe("official OpenClaw plugin contracts", () => {
       plugins: {
         entries: {
           "hindsight-memory": {
-            config: { bankId: "unresolved-root-bank", autoRecall: true },
+            config: { bankId: "unresolved-root-bank", scope: {} },
           },
         },
       },
     };
     expect(getPluginConfig(api as OpenClawPluginApi)).toMatchObject({
       bankId: "contract-bank",
-      autoRecall: false,
+      scope: { skipRecallSessions: ["**"] },
     });
     api.pluginConfig = undefined;
     expect(getPluginConfig(api as OpenClawPluginApi).bankId).not.toBe(
@@ -186,8 +184,7 @@ describe("official OpenClaw plugin contracts", () => {
     "recalls the same channel bank after dispatch (event.channel: %j)",
     async (channel) => {
       const fixture = await register({
-        autoRecall: true,
-        autoRetain: false,
+        scope: { skipRetainSessions: ["**"] },
         dynamicBankId: true,
         dynamicBankGranularity: ["provider", "channel"],
       });
@@ -226,8 +223,7 @@ describe("official OpenClaw plugin contracts", () => {
 
   it("infers a Telegram direct sender without leaking dispatch channelId into identity", async () => {
     const fixture = await register({
-      autoRecall: true,
-      autoRetain: false,
+      scope: { skipRetainSessions: ["**"] },
       dynamicBankId: true,
       dynamicBankGranularity: ["provider", "channel", "user"],
     });
@@ -250,8 +246,7 @@ describe("official OpenClaw plugin contracts", () => {
 
   it("still skips recall when an explicit dispatch provider disagrees with the session", async () => {
     const fixture = await register({
-      autoRecall: true,
-      autoRetain: false,
+      scope: { skipRetainSessions: ["**"] },
       dynamicBankId: true,
       dynamicBankGranularity: ["provider", "channel"],
     });
@@ -273,8 +268,7 @@ describe("official OpenClaw plugin contracts", () => {
     "defers ambiguous dispatch identity until the prompt hook (%s)",
     async (sessionKey) => {
       const fixture = await register({
-        autoRecall: true,
-        autoRetain: false,
+        scope: { skipRetainSessions: ["**"] },
         dynamicBankId: true,
         dynamicBankGranularity: ["agent", "provider", "channel"],
       });
@@ -301,7 +295,7 @@ describe("official OpenClaw plugin contracts", () => {
   );
 
   it("treats an explicitly empty currentUserMessage as a non-text request", async () => {
-    const fixture = await register({ autoRecall: true, autoRetain: false });
+    const fixture = await register({ scope: { skipRetainSessions: ["**"] } });
     await fixture.service.start();
     const recall = vi.spyOn(HindsightClient.prototype, "recall");
     const event: PromptEvent & { rawMessage: string } = {
@@ -317,7 +311,7 @@ describe("official OpenClaw plugin contracts", () => {
   });
 
   it("recalls the current user text instead of prompt history or adapter fields", async () => {
-    const fixture = await register({ autoRecall: true, autoRetain: false });
+    const fixture = await register({ scope: { skipRetainSessions: ["**"] } });
     await fixture.service.start();
     const recall = vi
       .spyOn(HindsightClient.prototype, "recall")
@@ -338,7 +332,7 @@ describe("official OpenClaw plugin contracts", () => {
   });
 
   it("falls back to the prompt only when currentUserMessage is omitted", async () => {
-    const fixture = await register({ autoRecall: true, autoRetain: false });
+    const fixture = await register({ scope: { skipRetainSessions: ["**"] } });
     await fixture.service.start();
     const recall = vi
       .spyOn(HindsightClient.prototype, "recall")
