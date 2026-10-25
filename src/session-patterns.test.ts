@@ -10,6 +10,11 @@ import {
 // ---------------------------------------------------------------------------
 
 describe("compileSessionPattern", () => {
+  it("matches regex punctuation literally", () => {
+    const p = compileSessionPattern("agent:main:review?.(draft)");
+    expect(p.test("agent:main:review?.(draft)")).toBe(true);
+    expect(p.test("agent:main:reviewXdraft")).toBe(false);
+  });
   it("matches an exact key", () => {
     const p = compileSessionPattern("agent:main:sess-123");
     expect(p.test("agent:main:sess-123")).toBe(true);

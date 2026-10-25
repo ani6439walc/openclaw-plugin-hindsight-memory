@@ -57,7 +57,17 @@ export interface OpenClawMessage {
   [key: string]: unknown;
 }
 
+/** Session-key exclusions for automatic memory only; explicit tools are unaffected. */
+export interface MemoryScope {
+  /** Skip automatic recall for matching session keys. Default: []; ["**"] disables it globally. */
+  skipRecallSessions?: string[];
+  /** Skip automatic retention for matching session keys. Default: []; ["**"] disables it globally. */
+  skipRetainSessions?: string[];
+}
+
 export interface PluginConfig {
+  /** Automatic recall/retain are enabled unless excluded by these session-key globs. */
+  scope?: MemoryScope;
   /**
    * Mission for the Reflect operation. Stamped onto the bank's `reflect_mission`
    * field via createBank() on first use. Has no effect on retain or recall.
@@ -112,10 +122,7 @@ export interface PluginConfig {
   retainTags?: string[]; // Tags applied to all retained documents after trimming and deduplication; auto-retain merges these with inline per-message retain-tag directives (e.g. ['source_system:openclaw', 'agent:agentname'])
   retainSource?: string; // Source written into retained document metadata (default: 'openclaw')
   retainContext?: string; // Interpretation guidance sent via the retain API context field. Defaults to built-in OpenClaw transcript/routing metadata guidance.
-  excludeProviders?: string[]; // Message providers to exclude from recall/retain (e.g. ['telegram', 'discord'])
-  autoRecall?: boolean; // Auto-recall memories on every prompt (default: true). Set to false when agent has its own recall tool.
   dynamicBankGranularity?: Array<"agent" | "provider" | "channel" | "user">; // Fields for bank ID derivation. Default: ['agent', 'channel', 'user']
-  autoRetain?: boolean; // Default: true
   retainRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include in retained transcript. Default: ['user', 'assistant']
   retainFormat?: "json" | "text"; // Serialization format for retained conversation content. Default: 'json' (structured array of {role, content}); 'text' emits legacy '[role: x] ... [x:end]' markers.
   retainToolCalls?: boolean; // When true (default) and retainFormat='json', each message's content is an Anthropic-shaped array of typed blocks (text, tool_use, tool_result) including the agent's tool calls and their results. When false, content is a flat string with only text.
@@ -133,16 +140,12 @@ export interface PluginConfig {
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'user' = before user message (default, preserves system prompt cache), 'prepend' = start of system prompt, 'append' = end of system prompt.
-  ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
-  statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
-  skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.
   debug?: boolean; // Enable debug logging (default: false)
   logLevel?: "off" | "error" | "warning" | "info" | "debug"; // Console log verbosity (default: 'info').
   logSummaryIntervalMs?: number; // Batch retain/recall log summaries over this interval in ms. 0 = log every event. Default: 300000 (5 min).
   retainQueuePath?: string; // Queue base path; durable entries are stored in the adjacent .d directory. Existing JSONL is migrated and archived. Default: ~/.openclaw/plugins/hindsight/retain-queue.jsonl
   retainQueueMaxAgeMs?: number; // Max age in ms for queued items. -1 = keep forever (default: -1)
   retainQueueFlushIntervalMs?: number; // How often to attempt flushing the queue in ms. Default: 60000 (1 min)
-  enableTools?: boolean; // Register knowledge and memory tools (knowledge_page and memory_*). Default: true.
   /**
    * Regex source matching a human display-name prefix that some channels
    * prepend to user text ("Alice: today weather?"). Supply the name part only

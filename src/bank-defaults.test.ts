@@ -16,7 +16,7 @@ const clientOpts = { baseUrl: "http://localhost:8888", apiKey: "test-token" };
 describe("hasConfiguredBankDefaults", () => {
   it("returns false when no bank default options are set", () => {
     expect(hasConfiguredBankDefaults({})).toBe(false);
-    expect(hasConfiguredBankDefaults({ autoRecall: true })).toBe(false);
+    expect(hasConfiguredBankDefaults({ scope: {} })).toBe(false);
   });
 
   it("returns true when any bank default or mission is configured", () => {

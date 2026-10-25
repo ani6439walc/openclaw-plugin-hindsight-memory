@@ -198,7 +198,10 @@ beforeAll(async () => {
   const handle = createMockApi({
     hindsightApiUrl: HINDSIGHT_API_URL,
     dynamicBankId: true,
-    excludeProviders: ["slack"],
+    scope: {
+      skipRecallSessions: ["agent:*:slack:**"],
+      skipRetainSessions: ["agent:*:slack:**"],
+    },
     retainEveryNTurns: 1, // retain every turn so individual tests aren't affected by chunking
     recallContextTurns: 3,
     recallMaxQueryChars: 180,
@@ -243,7 +246,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("before_prompt_build hook", () => {
-  it("skips recall for excluded providers and returns undefined", async () => {
+  it("skips recall for excluded sessions and returns undefined", async () => {
     const result = await triggerHook(
       "before_prompt_build",
       {
@@ -251,7 +254,11 @@ describe("before_prompt_build hook", () => {
         prompt: "What are my preferences?",
         messages: [],
       },
-      { messageProvider: "slack", senderId: "U001" },
+      {
+        sessionKey: "agent:main:slack:direct:U001",
+        messageProvider: "slack",
+        senderId: "U001",
+      },
     );
 
     expect(recallSpy).not.toHaveBeenCalled();
@@ -262,7 +269,11 @@ describe("before_prompt_build hook", () => {
     const result = await triggerHook(
       "before_prompt_build",
       { currentUserMessage: "Hi", prompt: "Hi", messages: [] },
-      { messageProvider: "telegram", senderId: "U001" },
+      {
+        sessionKey: "agent:main:telegram:direct:U001",
+        messageProvider: "telegram",
+        senderId: "U001",
+      },
     );
 
     expect(recallSpy).not.toHaveBeenCalled();
@@ -279,7 +290,11 @@ describe("before_prompt_build hook", () => {
         prompt: "",
         messages: [],
       },
-      { messageProvider: "telegram", senderId: "U002" },
+      {
+        sessionKey: "agent:main:telegram:direct:U002",
+        messageProvider: "telegram",
+        senderId: "U002",
+      },
     );
 
     expect(recallSpy).toHaveBeenCalledOnce();
@@ -301,7 +316,11 @@ describe("before_prompt_build hook", () => {
         prompt: "",
         messages: [],
       },
-      { messageProvider: "telegram", senderId: "U003" },
+      {
+        sessionKey: "agent:main:telegram:direct:U003",
+        messageProvider: "telegram",
+        senderId: "U003",
+      },
     )) as {
       prependContext: string;
       prependSystemContext?: string;
@@ -337,7 +356,11 @@ describe("before_prompt_build hook", () => {
         prompt: "",
         messages: [],
       },
-      { messageProvider: "telegram", senderId: "U004" },
+      {
+        sessionKey: "agent:main:telegram:direct:U004",
+        messageProvider: "telegram",
+        senderId: "U004",
+      },
     )) as { prependContext: string; prependSystemContext?: string };
 
     // formatMemories returns a bullet list, not JSON
@@ -361,7 +384,11 @@ describe("before_prompt_build hook", () => {
     await triggerHook(
       "before_prompt_build",
       { prompt: envelopePrompt, messages: [] },
-      { messageProvider: "telegram", senderId: "U005" },
+      {
+        sessionKey: "agent:main:telegram:direct:U005",
+        messageProvider: "telegram",
+        senderId: "U005",
+      },
     );
 
     expect(recallSpy).toHaveBeenCalledOnce();
@@ -386,7 +413,11 @@ describe("before_prompt_build hook", () => {
           { role: "user", content: "Do I still prefer dark mode?" },
         ],
       },
-      { messageProvider: "telegram", senderId: "U006A" },
+      {
+        sessionKey: "agent:main:telegram:direct:U006A",
+        messageProvider: "telegram",
+        senderId: "U006A",
+      },
     );
 
     expect(recallSpy).toHaveBeenCalledOnce();
@@ -407,7 +438,11 @@ describe("before_prompt_build hook", () => {
         prompt: "",
         messages: [],
       },
-      { messageProvider: "telegram", senderId: "U006" },
+      {
+        sessionKey: "agent:main:telegram:direct:U006",
+        messageProvider: "telegram",
+        senderId: "U006",
+      },
     );
 
     expect(recallSpy).toHaveBeenCalledOnce();
@@ -430,7 +465,11 @@ describe("before_prompt_build hook", () => {
         prompt: "",
         messages: [],
       },
-      { messageProvider: "telegram", senderId: "U007" },
+      {
+        sessionKey: "agent:main:telegram:direct:U007",
+        messageProvider: "telegram",
+        senderId: "U007",
+      },
     )) as { prependContext: string; prependSystemContext?: string };
 
     expect(result.prependSystemContext).toBeUndefined();
@@ -496,7 +535,11 @@ describe("agent_end hook", () => {
         success: false,
         messages: [{ role: "user", content: "Hello there world!" }],
       },
-      { messageProvider: "telegram", senderId: "U010" },
+      {
+        sessionKey: "agent:main:telegram:direct:U010",
+        messageProvider: "telegram",
+        senderId: "U010",
+      },
     );
 
     expect(retainSpy).not.toHaveBeenCalled();
@@ -506,20 +549,28 @@ describe("agent_end hook", () => {
     await triggerHook(
       "agent_end",
       { success: true, messages: [] },
-      { messageProvider: "telegram", senderId: "U011" },
+      {
+        sessionKey: "agent:main:telegram:direct:U011",
+        messageProvider: "telegram",
+        senderId: "U011",
+      },
     );
 
     expect(retainSpy).not.toHaveBeenCalled();
   });
 
-  it("skips retain for excluded providers", async () => {
+  it("skips retain for excluded sessions", async () => {
     await triggerHook(
       "agent_end",
       {
         success: true,
         messages: [{ role: "user", content: "I work as a software engineer." }],
       },
-      { messageProvider: "slack", senderId: "U012" },
+      {
+        sessionKey: "agent:main:slack:direct:U012",
+        messageProvider: "slack",
+        senderId: "U012",
+      },
     );
 
     expect(retainSpy).not.toHaveBeenCalled();
