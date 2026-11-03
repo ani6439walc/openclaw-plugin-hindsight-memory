@@ -210,7 +210,11 @@ export const DEFAULT_RETAIN_CONTEXT =
   "These are operational routing metadata, not semantic actors or people. " +
   "Messages with role 'assistant' are from the AI assistant; first-person statements " +
   "in assistant messages refer to the AI, not the human user. " +
-  "Messages with role 'user' are from the human user. " +
+  "Messages with role 'user' may have different speakers. The per-message 'sender' " +
+  "object (id, name, username), also rendered as [sender: {...}] in text transcripts, " +
+  "provides speaker attribution separate from the model role. Use only its supplied " +
+  "fields; do not copy a sender onto other messages or guess missing identities. " +
+  "Opaque sender IDs are identifiers, not human names. " +
   "Bank IDs, session keys, agent IDs, thread IDs, source systems, " +
   "and tags in metadata are also operational routing identifiers, " +
   "not human names, project names, or organizations.";
@@ -935,24 +939,58 @@ function getStaticBankId(pluginConfig: PluginConfig): string {
 }
 
 /**
- * Strip plugin-injected memory tags from content to prevent retain feedback loop.
- * Removes <hindsight_memories> and <relevant_memories> blocks that were injected
- * during before_prompt_build so they don't get re-stored into the memory bank.
+ * Strip injected memory and skill context to prevent recall/retain feedback loops.
+ * Includes current plugin wrappers, native Active Memory and legacy memory tags.
  */
 export function stripMemoryTags(content: string): string {
-  content = content.replace(
-    /<hindsight_memory_plugin>[\s\S]*?<\/hindsight_memory_plugin>/g,
-    "",
+  return content.replace(injectedContextBlockPattern(), "");
+}
+
+function injectedContextBlockPattern(): RegExp {
+  return /(?:Context:\s*)?<(hindsight_memory_plugin|skill_harness_plugin|active_memory_plugin|hindsight_memories|relevant_memories)\b[^>]*>[\s\S]*?<\/\1>/gi;
+}
+
+/** Strip complete injected blocks across text parts without moving other blocks. */
+function stripMemoryTagsFromBlocks(
+  blocks: OpenClawMessageContentBlock[],
+): OpenClawMessageContentBlock[] {
+  return stripTextRangesFromBlocks(blocks, (text) =>
+    Array.from(text.matchAll(injectedContextBlockPattern()), (match) => ({
+      start: match.index,
+      end: match.index + match[0].length,
+    })),
   );
-  content = content.replace(
-    /<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g,
-    "",
-  );
-  content = content.replace(
-    /<relevant_memories>[\s\S]*?<\/relevant_memories>/g,
-    "",
-  );
-  return content;
+}
+
+function stripTextRangesFromBlocks(
+  blocks: OpenClawMessageContentBlock[],
+  findRanges: (text: string) => Array<{ start: number; end: number }>,
+): OpenClawMessageContentBlock[] {
+  const text = blocks
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n");
+  const ranges = findRanges(text);
+  if (ranges.length === 0) return blocks;
+
+  let offset = 0;
+  return blocks.map((block) => {
+    if (block?.type !== "text" || typeof block.text !== "string") return block;
+    const start = offset;
+    const end = start + block.text.length;
+    offset = end + 1; // Account for the newline joining text parts above.
+    let cursor = start;
+    const parts: string[] = [];
+    for (const range of ranges) {
+      const overlapStart = Math.max(start, range.start);
+      const overlapEnd = Math.min(end, range.end);
+      if (overlapStart >= overlapEnd) continue;
+      parts.push(text.slice(cursor, overlapStart));
+      cursor = overlapEnd;
+    }
+    parts.push(text.slice(cursor, end));
+    return { ...block, text: parts.join("") };
+  });
 }
 
 /**
@@ -1033,6 +1071,58 @@ interface InboundMetaBlock {
   end: number;
   /** Parsed body when the block is a ```json fence, otherwise undefined. */
   json?: unknown;
+}
+
+interface RetainedSender {
+  id?: string;
+  name?: string;
+  username?: string;
+}
+
+/** Read only this user's leading Conversation info envelope, before stripping it. */
+function extractRetainedSender(
+  message: OpenClawMessage,
+): RetainedSender | undefined {
+  if (message.role !== "user") return undefined;
+  const text = stripInlineTimestampPrefix(
+    stripInternalRuntimeContext(
+      stripMemoryTags(extractMessageText(message.content)),
+    )
+      .trimStart()
+      .replace(/^---[ \t]*\r?\n/, ""),
+  ).trimStart();
+  let cursor = 0;
+  for (const block of findInboundMetaBlocks(text)) {
+    // Later quoted examples are not the message's own inbound envelope.
+    if (text.slice(cursor, block.start).trim()) return undefined;
+    cursor = block.end;
+    const newline = text.indexOf("\n", block.start);
+    const header = text
+      .slice(block.start, newline < 0 ? text.length : newline)
+      .trim();
+    if (
+      !/^Conversation info(?::\s*⟦openclaw:ctx⟧|\s*\(untrusted metadata\):)\s*$/i.test(
+        header,
+      )
+    ) {
+      continue;
+    }
+    if (
+      !block.json ||
+      typeof block.json !== "object" ||
+      Array.isArray(block.json)
+    )
+      return undefined;
+    const raw = (block.json as Record<string, unknown>).sender;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const sender: RetainedSender = {};
+    for (const key of ["id", "name", "username"] as const) {
+      const value = (raw as Record<string, unknown>)[key];
+      if (typeof value === "string" && value.trim()) sender[key] = value;
+    }
+    return Object.keys(sender).length > 0 ? sender : undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -1328,7 +1418,9 @@ export function extractRecallQuery(
   // Strip sender metadata envelope before any checks
   if (recallQuery) {
     recallQuery = stripRuntimeEnvelope(
-      stripInlineTimestampPrefix(stripMetadataEnvelopes(recallQuery)),
+      stripInlineTimestampPrefix(
+        stripMetadataEnvelopes(stripMemoryTags(recallQuery)),
+      ),
     );
   }
   if (
@@ -1342,7 +1434,9 @@ export function extractRecallQuery(
     // Strip metadata envelopes from prompt too, then check if anything useful remains
     if (recallQuery) {
       recallQuery = stripRuntimeEnvelope(
-        stripInlineTimestampPrefix(stripMetadataEnvelopes(recallQuery)),
+        stripInlineTimestampPrefix(
+          stripMetadataEnvelopes(stripMemoryTags(recallQuery)),
+        ),
       );
     }
     if (!recallQuery || recallQuery.length < 5) {
@@ -1405,7 +1499,7 @@ export function composeRecallQuery(
     "assistant",
   ],
 ): string {
-  const latest = latestQuery.trim();
+  const latest = stripMemoryTags(latestQuery).trim();
   if (
     recallContextTurns <= 1 ||
     !Array.isArray(messages) ||
@@ -4401,6 +4495,7 @@ export function prepareRetentionTranscript(
     role: string;
     content: string;
     timestamp?: string;
+    sender?: RetainedSender;
   }> = [];
   for (const msg of filteredMessages) {
     const role = msg.role || "unknown";
@@ -4424,9 +4519,13 @@ export function prepareRetentionTranscript(
 
     if (content.trim()) {
       const timestamp = normalizeMessageTimestamp(msg);
-      normalized.push(
-        timestamp ? { role, content, timestamp } : { role, content },
-      );
+      const sender = extractRetainedSender(msg);
+      normalized.push({
+        role,
+        content,
+        ...(timestamp ? { timestamp } : {}),
+        ...(sender ? { sender } : {}),
+      });
     }
   }
 
@@ -4436,7 +4535,10 @@ export function prepareRetentionTranscript(
   let messageCount: number;
   if (format === "text") {
     transcript = normalized
-      .map(({ role, content }) => `[role: ${role}]\n${content}\n[${role}:end]`)
+      .map(
+        ({ role, content, sender }) =>
+          `[role: ${role}]\n${sender ? `[sender: ${JSON.stringify(sender)}]\n` : ""}${content}\n[${role}:end]`,
+      )
       .join("\n\n");
     messageCount = normalized.length;
   } else {
@@ -4471,11 +4573,21 @@ const TOOL_RESULT_MAX_CHARS = 2000;
 function buildAnthropicStructuredMessages(
   messages: any[],
   pluginConfig: PluginConfig,
-): Array<{ role: string; content: any[]; timestamp?: string }> {
+): Array<{
+  role: string;
+  content: any[];
+  timestamp?: string;
+  sender?: RetainedSender;
+}> {
   const allowedRoles = new Set(
     pluginConfig.retainRoles || ["user", "assistant"],
   );
-  const out: Array<{ role: string; content: any[]; timestamp?: string }> = [];
+  const out: Array<{
+    role: string;
+    content: any[];
+    timestamp?: string;
+    sender?: RetainedSender;
+  }> = [];
 
   for (const msg of messages) {
     const rawRole = msg?.role;
@@ -4503,11 +4615,13 @@ function buildAnthropicStructuredMessages(
     const blocks = extractStructuredBlocks(msg.content, rawRole);
     if (blocks.length > 0) {
       const timestamp = normalizeMessageTimestamp(msg);
-      out.push(
-        timestamp
-          ? { role: rawRole, content: blocks, timestamp }
-          : { role: rawRole, content: blocks },
-      );
+      const sender = extractRetainedSender(msg);
+      out.push({
+        role: rawRole,
+        content: blocks,
+        ...(timestamp ? { timestamp } : {}),
+        ...(sender ? { sender } : {}),
+      });
     }
   }
 
@@ -4538,7 +4652,12 @@ function extractStructuredBlocks(content: any, role: string): any[] {
   }
   if (!Array.isArray(content)) return [];
 
-  const sanitizedContent = sanitizeInternalRuntimeContextFromBlocks(content);
+  const sanitizedContent = stripTextRangesFromBlocks(
+    stripMemoryTagsFromBlocks(
+      sanitizeInternalRuntimeContextFromBlocks(content),
+    ),
+    findInboundMetaBlocks,
+  );
   const blocks: any[] = [];
   for (const block of sanitizedContent) {
     if (!block || typeof block !== "object") continue;

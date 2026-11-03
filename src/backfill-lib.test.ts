@@ -44,6 +44,48 @@ afterEach(() => {
 });
 
 describe("backfill planning", () => {
+  it("preserves each message's Conversation info sender in backfill content", () => {
+    const root = makeTempRoot();
+    const message = (sender: Record<string, string>, text: string) => ({
+      type: "message",
+      message: {
+        role: "user",
+        content: `Conversation info: ⟦openclaw:ctx⟧\n\`\`\`json\n${JSON.stringify({ sender, chat_id: "discard-chat" })}\n\`\`\`\n\n${text}`,
+      },
+    });
+    const alice = { id: "alice-id", name: "Alice", username: "alice" };
+    const bob = { id: "bob-id", name: "Bob", username: "bob" };
+    writeSession(root, "main", "speakers.jsonl", [
+      {
+        type: "session",
+        id: "speakers",
+        sessionKey: "agent:main:discord:group:test",
+      },
+      message(alice, "I cancelled my subscription."),
+      message(bob, "Mine is still active."),
+      {
+        type: "message",
+        message: { role: "user", content: "My sender is unavailable." },
+      },
+    ]);
+
+    const result = buildBackfillPlan(
+      { dynamicBankId: false, bankId: "test" },
+      {
+        openclawRoot: root,
+        includeArchive: false,
+        bankStrategy: "mirror-config",
+      },
+    );
+
+    expect(result.entries).toHaveLength(1);
+    const retained = JSON.parse(result.entries[0].transcript);
+    expect(retained.map((entry: { sender?: unknown }) => entry.sender)).toEqual(
+      [alice, bob, undefined],
+    );
+    expect(result.entries[0].transcript).not.toContain("discard-chat");
+  });
+
   it("mirrors plugin bank routing from config by default", () => {
     const root = makeTempRoot();
     writeOpenClawConfig(root, {
