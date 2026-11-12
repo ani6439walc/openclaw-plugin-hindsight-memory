@@ -5158,7 +5158,10 @@ export function prepareRetentionTranscript(
     } else if (Array.isArray(msg.content)) {
       const sanitized = sanitizeInternalRuntimeContextFromBlocks(msg.content);
       content = sanitized
-        .filter((block: any) => block.type === "text")
+        .filter(
+          (block: any) =>
+            block?.type === "text" && typeof block.text === "string",
+        )
         .map((block: any) => block.text)
         .join("\n");
     }

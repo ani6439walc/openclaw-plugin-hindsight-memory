@@ -446,6 +446,12 @@ uvx hindsight-embed@latest profile list
 
 The package includes a config-aware backfill CLI for importing historical OpenClaw sessions into Hindsight.
 
+Backfill discovers active SQLite transcripts through the host and continues to read legacy JSONL files, including the existing migration archive directory. Retained/reset SQLite transcripts require `--include-retained-sqlite`; this is separate from `--include-archive` / `--exclude-archive`, which keep their migration JSONL meaning. Host reset/deleted file archives and compressed artifacts are not added automatically.
+
+The host must provide the public `openclaw/plugin-sdk/session-transcript-readonly` capability, including read-only corpus discovery and complete visible-branch snapshots. Stock OpenClaw `2026.11.3` does not provide that entrypoint. The CLI checks the capability before reading configuration or transcripts and refuses an unsupported host instead of using an older reader that can restore cold data. Install a supported host release before running this CLI; editing installed core bundles is not a supported setup procedure. The live plugin's existing host compatibility is separate from this backfill capability requirement.
+
+`--openclaw-root` selects the configuration and state root. Host imports run in a separate source process with that root and its `openclaw.json` bound before module loading; configured session-store overrides remain authoritative. `--profile` is a reporting label and does not select another data directory.
+
 By default it mirrors the active plugin settings for:
 
 - `dynamicBankId`
@@ -482,10 +488,19 @@ Useful options:
 
 - `--agent <id>` limit import to selected agents
 - `--exclude-archive` ignore `sessions-archive-from-migration_backup`
+- `--include-retained-sqlite` also include retained/reset SQLite transcripts; off by default, independently of migration archives
 - `--bank-strategy mirror-config|agent|fixed`
 - `--resume` skip only entries already finalized as completed
 - `--checkpoint <path>` store progress outside the default location
 - `--wait-until-drained` block until the touched bank queues have finished and checkpoint state can be finalized
+
+Planning retains each source's original messages, tool calls/results, recorded timestamps, provenance and per-message sender attribution, then applies the same retention filtering used by live turns. SQLite snapshots follow the host's visible branch. Missing attribution or timestamps are left unknown.
+
+The plan deduplicates copies by agent and session identity, prefers SQLite as the canonical source, and rejects conflicting copies rather than silently choosing different content. Traversal is deterministic and duplicate copies do not consume the session limit. Document IDs remain `backfill::<bankId>::<agentId>::<sessionId>`, and checkpoint version 1 remains readable. New checkpoint rows record source identity; `filePath` / `file_path` refer only to real JSONL files, while SQLite metadata preserves the host's logical store selector.
+
+Dry-run never initializes Hindsight, enqueues retain requests, saves a checkpoint, or restores a cold transcript. The summary distinguishes missing stores, filtered/empty transcripts and duplicate sources. Cold, refused, schema-unavailable, unreadable or conflicting selected sources stop the plan before any Hindsight initialization; `--json` reports an incomplete source plan with `plan_complete: false`. Read-only SQLite access may use normal coordination sidecars, so this contract concerns source data and writable lifecycle operations rather than promising that the filesystem never changes.
+
+Resume still skips only completed checkpoint entries. Entries previously enqueued retain their existing behavior: `--wait-until-drained` waits for that work; otherwise they can be sent again. This does not provide exactly-once delivery after a lost acknowledgement, and existing remote memories are not rewritten by a dry-run.
 
 ## Links
 

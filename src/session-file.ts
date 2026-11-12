@@ -3,16 +3,17 @@
 // Lifted out of `backfill-lib.ts` so the plugin can read a transcript without
 // importing that module: `backfill-lib` imports `./index.js`, and having index
 // import it back would make the cycle load-order dependent. The parsing is
-// unchanged; `backfill-lib` re-exports it so its own surface is the same.
-import { readFileSync } from "fs";
+// shared with the JSONL backfill source; `backfill-lib` re-exports its surface.
+import { createReadStream, readFileSync } from "fs";
+import { basename } from "node:path";
+import { createInterface } from "node:readline";
+import type { OpenClawMessage } from "./types.js";
 
-export interface SessionMessage {
-  role: "user" | "assistant" | "system" | "tool";
-  content: string | Array<{ type?: string; text?: string }>;
+export interface SessionMessage extends OpenClawMessage {
+  role: "user" | "assistant" | "system" | "tool" | "toolResult";
 }
 
-export interface ParsedSessionFile {
-  filePath: string;
+export interface ParsedSessionTranscript {
   agentId: string;
   sessionId: string;
   sessionKey?: string;
@@ -20,23 +21,42 @@ export interface ParsedSessionFile {
   messages: SessionMessage[];
 }
 
-function extractTextContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
+export interface ParsedSessionFile extends ParsedSessionTranscript {
+  filePath: string;
+}
+
+/** Resolve logical identity without loading every transcript's message window. */
+export async function readSessionFileIdentity(
+  filePath: string,
+  agentId: string,
+): Promise<{ agentId: string; sessionId: string }> {
+  const sessionId = basename(filePath).replace(/\.jsonl$/, "") || "session";
+  const input = createReadStream(filePath, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      const record: unknown = JSON.parse(line);
+      if (
+        record &&
+        typeof record === "object" &&
+        "type" in record &&
+        record.type === "session"
+      ) {
+        return {
+          agentId,
+          sessionId:
+            "id" in record && typeof record.id === "string"
+              ? record.id
+              : sessionId,
+        };
+      }
+    }
+    return { agentId, sessionId };
+  } finally {
+    lines.close();
+    input.destroy();
   }
-  if (Array.isArray(content)) {
-    return content
-      .filter(
-        (block): block is { type?: string; text?: string } =>
-          !!block && typeof block === "object",
-      )
-      .filter(
-        (block) => block.type === "text" && typeof block.text === "string",
-      )
-      .map((block) => block.text || "")
-      .join("\n");
-  }
-  return "";
 }
 
 function readJsonLines(filePath: string): unknown[] {
@@ -52,17 +72,30 @@ export function parseSessionFile(
   filePath: string,
   agentId: string,
 ): ParsedSessionFile {
-  const records = readJsonLines(filePath) as Array<Record<string, any>>;
-  let sessionId =
+  const sessionId =
     filePath
       .split("/")
       .pop()
       ?.replace(/\.jsonl$/, "") || "session";
-  let sessionKey: string | undefined;
+  return {
+    filePath,
+    ...parseSessionRecords(readJsonLines(filePath), { agentId, sessionId }),
+  };
+}
+
+/** Share raw event handling between legacy JSONL and host-owned snapshots. */
+export function parseSessionRecords(
+  records: readonly unknown[],
+  identity: { agentId: string; sessionId: string; sessionKey?: string },
+): ParsedSessionTranscript {
+  const { agentId } = identity;
+  let { sessionId, sessionKey } = identity;
   let startedAt: string | undefined;
   const messages: SessionMessage[] = [];
 
-  for (const record of records) {
+  for (const value of records) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const record = value as Record<string, unknown>;
     if (record.type === "session") {
       sessionId = typeof record.id === "string" ? record.id : sessionId;
       startedAt =
@@ -74,7 +107,8 @@ export function parseSessionFile(
     if (
       record.type !== "message" ||
       !record.message ||
-      typeof record.message !== "object"
+      typeof record.message !== "object" ||
+      Array.isArray(record.message)
     ) {
       continue;
     }
@@ -84,28 +118,28 @@ export function parseSessionFile(
       role !== "user" &&
       role !== "assistant" &&
       role !== "system" &&
-      role !== "tool"
+      role !== "tool" &&
+      role !== "toolResult"
     ) {
       continue;
     }
-    const text = extractTextContent(message.content);
-    if (!text.trim()) {
-      continue;
+    // Preserve provenance, tool links and non-text blocks for the shared
+    // retention pipeline. Text projection here loses classification evidence.
+    const parsedMessage = { ...message, role } as SessionMessage;
+    if (
+      !("timestamp" in message) &&
+      (typeof record.timestamp === "string" ||
+        typeof record.timestamp === "number")
+    ) {
+      parsedMessage.timestamp = record.timestamp;
     }
-    messages.push({
-      role,
-      content:
-        typeof message.content === "string"
-          ? message.content
-          : [{ type: "text", text }],
-    });
+    messages.push(parsedMessage);
     if (!sessionKey && typeof record.sessionKey === "string") {
       sessionKey = record.sessionKey;
     }
   }
 
   return {
-    filePath,
     agentId,
     sessionId,
     sessionKey,
