@@ -1,5 +1,6 @@
 import type {
   InputProvenance,
+  MemoryAudience,
   OpenClawPluginApi,
   OpenClawMessage,
   OpenClawMessageContentBlock,
@@ -8,12 +9,18 @@ import type {
   PluginHookEvent,
   PluginHookSessionContext,
   OpenClawPluginToolContext,
+  OpenClawPluginToolFactory,
   MemoryResult,
   RetainRequest,
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
 import {
+  createClient,
+  createConfig,
+  DEFAULT_MAX_ATTEMPTS,
   HindsightClient,
+  retryOnCapacity,
+  sdk,
   type HindsightClientOptions,
   type MinScores,
 } from "@vectorize-io/hindsight-client";
@@ -157,11 +164,311 @@ export async function executeKnowledgePageAction<Result>(
 
 import {
   applyConfiguredBankDefaults,
+  createAuthorityGuardHandle,
   hasConfiguredBankDefaults,
   normalizeDispositionTrait,
   normalizeEntityLabels,
   normalizeRetainExtractionMode,
+  withAuthorityGuardedClient,
+  type AuthorityGuardHandle,
 } from "./bank-defaults.js";
+
+type KnowledgeFactType = "world" | "experience" | "observation";
+const KNOWLEDGE_FACT_TYPES: readonly KnowledgeFactType[] = [
+  "world",
+  "experience",
+  "observation",
+];
+const DEFAULT_KNOWLEDGE_RECALL_FACT_TYPES: readonly KnowledgeFactType[] = [
+  "world",
+  "experience",
+];
+const DEFAULT_KNOWLEDGE_REFLECT_FACT_TYPES: readonly KnowledgeFactType[] =
+  KNOWLEDGE_FACT_TYPES;
+const DEFAULT_KNOWLEDGE_RECALL_MAX_TOKENS = 1024;
+const KNOWLEDGE_PAGE_TRIGGER_DEFAULTS = {
+  mode: "delta" as const,
+  refresh_after_consolidation: true,
+  exclude_mental_models: true,
+  fact_types: ["observation" as const],
+};
+
+type InvocationKnowledgeToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+};
+
+type InvocationKnowledgeDelegate = {
+  execute: (
+    params: Record<string, unknown>,
+  ) => Promise<InvocationKnowledgeToolResult>;
+};
+
+function formatKnowledgeToolResult(
+  data: unknown,
+): InvocationKnowledgeToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+function normalizeKnowledgeFactTypes(
+  input: unknown,
+  defaultTypes: readonly KnowledgeFactType[],
+): KnowledgeFactType[] {
+  if (input === undefined || input === null) {
+    return [...defaultTypes];
+  }
+  const raw = Array.isArray(input)
+    ? input
+    : typeof input === "string"
+      ? input.split(/[\s,]+/).filter(Boolean)
+      : [];
+  const normalized = raw.filter(
+    (t): t is KnowledgeFactType =>
+      typeof t === "string" &&
+      (KNOWLEDGE_FACT_TYPES as readonly string[]).includes(t),
+  );
+  if (normalized.length !== raw.length || normalized.length === 0) {
+    throw new Error(
+      `Invalid fact_types/types. Expected one or more of: ${KNOWLEDGE_FACT_TYPES.join(", ")}`,
+    );
+  }
+  return [...new Set(normalized)];
+}
+
+function parseKnowledgeRecallMaxTokens(input: unknown): number {
+  if (input === undefined || input === null) {
+    return DEFAULT_KNOWLEDGE_RECALL_MAX_TOKENS;
+  }
+  const n = Math.floor(Number(input));
+  if (!Number.isFinite(n) || n < 1) {
+    return DEFAULT_KNOWLEDGE_RECALL_MAX_TOKENS;
+  }
+  return n;
+}
+
+function createInvocationKnowledgeTools(opts: {
+  apiUrl: string;
+  apiToken: string | undefined;
+  bankId: string;
+  userAgent: string;
+  guard: AuthorityGuardHandle;
+}): {
+  invocationClient: HindsightClient;
+  rawToolsByName: Map<string, InvocationKnowledgeDelegate>;
+} {
+  const baseClient = new HindsightClient({
+    baseUrl: opts.apiUrl,
+    apiKey: opts.apiToken,
+    userAgent: opts.userAgent,
+  });
+  const invocationClient = withAuthorityGuardedClient(baseClient, opts.guard);
+  const lowLevel = createClient(
+    createConfig({
+      baseUrl: opts.apiUrl,
+      headers: {
+        ...(opts.apiToken ? { Authorization: `Bearer ${opts.apiToken}` } : {}),
+        "User-Agent": opts.userAgent,
+      },
+      fetch: opts.guard.guardedFetch,
+    }),
+  );
+  const { bankId, guard } = opts;
+
+  const rawToolsByName = new Map<string, InvocationKnowledgeDelegate>([
+    [
+      "agent_knowledge_list_pages",
+      {
+        async execute() {
+          const resp = await sdk.listMentalModels({
+            client: lowLevel,
+            path: { bank_id: bankId },
+            query: { detail: "metadata" },
+          });
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_list_pages failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_get_page",
+      {
+        async execute(params) {
+          const resp = await sdk.getMentalModel({
+            client: lowLevel,
+            path: {
+              bank_id: bankId,
+              mental_model_id: String(params.page_id ?? ""),
+            },
+            query: { detail: "content" },
+          });
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_get_page failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_create_page",
+      {
+        async execute(params) {
+          const resp = await sdk.createMentalModel({
+            client: lowLevel,
+            path: { bank_id: bankId },
+            body: {
+              id: String(params.page_id ?? ""),
+              name: String(params.name ?? ""),
+              source_query: String(params.source_query ?? ""),
+              max_tokens: 4096,
+              trigger: {
+                ...KNOWLEDGE_PAGE_TRIGGER_DEFAULTS,
+                fact_types: [...KNOWLEDGE_PAGE_TRIGGER_DEFAULTS.fact_types],
+              },
+            },
+          });
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_create_page failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_update_page",
+      {
+        async execute(params) {
+          const result = await invocationClient.updateMentalModel(
+            bankId,
+            String(params.page_id ?? ""),
+            {
+              name: typeof params.name === "string" ? params.name : undefined,
+              sourceQuery:
+                typeof params.source_query === "string"
+                  ? params.source_query
+                  : undefined,
+            },
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult(result);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_delete_page",
+      {
+        async execute(params) {
+          await invocationClient.deleteMentalModel(
+            bankId,
+            String(params.page_id ?? ""),
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult({ success: true });
+        },
+      },
+    ],
+    [
+      "agent_knowledge_recall",
+      {
+        async execute(params) {
+          const maxTokens = parseKnowledgeRecallMaxTokens(params.max_tokens);
+          const types = normalizeKnowledgeFactTypes(
+            params.fact_types ?? params.types,
+            DEFAULT_KNOWLEDGE_RECALL_FACT_TYPES,
+          );
+          const result = await invocationClient.recall(
+            bankId,
+            String(params.query ?? ""),
+            {
+              maxTokens,
+              types,
+            },
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult(result);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_reflect",
+      {
+        async execute(params) {
+          const factTypes = normalizeKnowledgeFactTypes(
+            params.fact_types,
+            DEFAULT_KNOWLEDGE_REFLECT_FACT_TYPES,
+          );
+          const parsedMaxTokens = Math.floor(Number(params.max_tokens ?? 1024));
+          const maxTokens = Number.isFinite(parsedMaxTokens)
+            ? Math.max(1, parsedMaxTokens)
+            : 1024;
+          const budget =
+            params.budget === "mid" ||
+            params.budget === "high" ||
+            params.budget === "low"
+              ? params.budget
+              : "low";
+          const resp = await retryOnCapacity(
+            () =>
+              sdk.reflect({
+                client: lowLevel,
+                path: { bank_id: bankId },
+                body: {
+                  query: String(params.query ?? ""),
+                  budget,
+                  max_tokens: maxTokens,
+                  fact_types: [...factTypes],
+                  include:
+                    params.include_facts === true ? { facts: {} } : undefined,
+                  exclude_mental_models:
+                    typeof params.exclude_mental_models === "boolean"
+                      ? params.exclude_mental_models
+                      : undefined,
+                },
+              }),
+            DEFAULT_MAX_ATTEMPTS,
+          );
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_reflect failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_ingest",
+      {
+        async execute(params) {
+          const docId = String(params.title ?? "")
+            .toLowerCase()
+            .replace(/ /g, "-");
+          const result = await invocationClient.retainBatch(
+            bankId,
+            [{ content: String(params.content ?? ""), document_id: docId }],
+            { async: true },
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult(result);
+        },
+      },
+    ],
+  ]);
+
+  return { invocationClient, rawToolsByName };
+}
 
 /**
  * Structured payload for a knowledge tool result.
@@ -376,18 +683,51 @@ export function scopeClient(
 async function ensureBankDefaultsApplied(
   bankId: string,
   config: PluginConfig,
+  options?: {
+    assertAuthorityCurrent?: () => void;
+    rethrowAuthorityError?: () => void;
+    clientOverride?: HindsightClient;
+  },
 ): Promise<void> {
-  if (!client || !clientOptions || !hasConfiguredBankDefaults(config)) {
+  if (!hasConfiguredBankDefaults(config)) {
+    return;
+  }
+  const activeClient = options?.clientOverride ?? client;
+  if (!activeClient) {
     return;
   }
   if (banksWithDefaultsApplied.has(bankId)) {
     return;
   }
+  // Prioritize explicit invocation/audience revocation errors over best-effort
+  // network or AbortError failures so cancelled runs reject instead of warning.
+  let authorityFailure: unknown;
+  const guardedAssertAuthority = options?.assertAuthorityCurrent
+    ? () => {
+        try {
+          options.assertAuthorityCurrent!();
+        } catch (err) {
+          authorityFailure ??= err;
+          throw err;
+        }
+      }
+    : undefined;
   try {
-    await applyConfiguredBankDefaults(client, bankId, config);
+    await applyConfiguredBankDefaults(
+      activeClient,
+      bankId,
+      config,
+      guardedAssertAuthority,
+    );
+    options?.rethrowAuthorityError?.();
     banksWithDefaultsApplied.add(bankId);
     debug(`[Hindsight] Applied configured defaults for bank: ${bankId}`);
   } catch (error) {
+    options?.rethrowAuthorityError?.();
+    if (authorityFailure !== undefined) {
+      throw authorityFailure;
+    }
+    options?.assertAuthorityCurrent?.();
     log.warn(
       `could not apply bank defaults for ${bankId}: ${error instanceof Error ? error.message : error}`,
     );
@@ -1704,20 +2044,83 @@ export function extractTelegramDirectSenderId(
   return match?.[1];
 }
 
+function normalizeNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function hasConflictingHostSenderId(
+  ctx: PluginHookAgentContext | undefined,
+): boolean {
+  const directSenderId = normalizeNonEmptyString(ctx?.senderId);
+  const channelSenderId = normalizeNonEmptyString(
+    ctx?.channelContext?.sender?.id,
+  );
+  return Boolean(
+    directSenderId && channelSenderId && directSenderId !== channelSenderId,
+  );
+}
+
+function getTrustedHostSenderId(
+  ctx: PluginHookAgentContext | undefined,
+): string | undefined {
+  if (hasConflictingHostSenderId(ctx)) {
+    return normalizeNonEmptyString(ctx?.senderId);
+  }
+  return (
+    normalizeNonEmptyString(ctx?.senderId) ??
+    normalizeNonEmptyString(ctx?.channelContext?.sender?.id)
+  );
+}
+
+function isOperationalOrAgentSession(
+  ctx: PluginHookAgentContext | undefined,
+): boolean {
+  const sessionKey = ctx?.sessionKey;
+  if (typeof sessionKey === "string") {
+    if (/^agent:[^:]+:main$/.test(sessionKey)) return true;
+    if (
+      /^agent:[^:]+:(?:cron|heartbeat|subagent|dashboard):/.test(sessionKey)
+    ) {
+      return true;
+    }
+  }
+  const provider = ctx?.messageProvider;
+  return (
+    provider === "main" ||
+    provider === "cron" ||
+    provider === "heartbeat" ||
+    provider === "subagent" ||
+    provider === "cli"
+  );
+}
+
 export function resolveSessionIdentity(
   ctx: PluginHookAgentContext | undefined,
 ): PluginHookAgentContext | undefined {
   if (!ctx) return undefined;
 
   const sessionParsed = ctx.sessionKey ? parseSessionKey(ctx.sessionKey) : {};
-  const messageProvider = ctx.messageProvider || sessionParsed.provider;
-  const channelId = ctx.channelId || sessionParsed.channel;
+  const messageProvider =
+    normalizeNonEmptyString(ctx.messageProvider) ||
+    normalizeNonEmptyString(ctx.channel) ||
+    sessionParsed.provider;
+  const channelId =
+    normalizeNonEmptyString(ctx.channelId) ||
+    sessionParsed.channel ||
+    normalizeNonEmptyString(ctx.chatId) ||
+    normalizeNonEmptyString(ctx.channelContext?.chat?.id);
+  const hostSenderConflict = hasConflictingHostSenderId(ctx);
+  const hostSenderId = getTrustedHostSenderId(ctx);
   // direct:<id> channel ids carry the user id for any provider (telegram, msteams, …).
-  const senderId = ctx.senderId || extractTelegramDirectSenderId(channelId);
+  const senderId = hostSenderConflict
+    ? hostSenderId
+    : hostSenderId || extractTelegramDirectSenderId(channelId);
 
   return {
     ...ctx,
-    agentId: ctx.agentId || sessionParsed.agentId,
+    agentId: normalizeNonEmptyString(ctx.agentId) || sessionParsed.agentId,
     messageProvider,
     channelId,
     senderId,
@@ -1771,27 +2174,32 @@ function logSkipOnce(
 
 function cacheSessionIdentity(
   sessionKey: string | undefined,
-  resolvedCtx: PluginHookAgentContext | undefined,
+  trustedIdentity:
+    | {
+        senderId?: string;
+        messageProvider?: string;
+        channelId?: string;
+      }
+    | undefined,
 ): void {
-  if (!sessionKey || !resolvedCtx) return;
+  if (!sessionKey || !trustedIdentity) return;
   if (
-    !resolvedCtx.messageProvider &&
-    !resolvedCtx.channelId &&
-    !resolvedCtx.senderId
+    !trustedIdentity.messageProvider &&
+    !trustedIdentity.channelId &&
+    !trustedIdentity.senderId
   )
     return;
 
   setCappedMapValue(sessionIdentityBySession, sessionKey, {
-    senderId: resolvedCtx.senderId,
-    messageProvider: resolvedCtx.messageProvider,
-    channelId: resolvedCtx.channelId,
+    senderId: trustedIdentity.senderId,
+    messageProvider: trustedIdentity.messageProvider,
+    channelId: trustedIdentity.channelId,
   });
 }
 
 export interface ResolveAndCacheIdentityOptions {
   sessionKey?: string;
   ctx?: PluginHookAgentContext;
-  senderIdHint?: string;
   dispatchChannel?: string;
   pluginConfig?: PluginConfig;
 }
@@ -1811,6 +2219,8 @@ export function resolveAndCacheIdentity(
   const baseCtx =
     options.ctx ||
     (sessionKey ? ({ sessionKey } as PluginHookAgentContext) : undefined);
+  const baseHostSenderConflict = hasConflictingHostSenderId(baseCtx);
+  const baseTrustedSenderId = getTrustedHostSenderId(baseCtx);
   // Main and operational namespaces do not name the live dispatch surface.
   // Prefer the actual context/cache/dispatch provider over these fallbacks.
   const sessionProvider =
@@ -1819,22 +2229,21 @@ export function resolveAndCacheIdentity(
       ? parsedSession.provider
       : undefined;
   const effectiveCtx =
-    baseCtx ||
-    cachedIdentity ||
-    options.senderIdHint ||
-    options.dispatchChannel ||
-    sessionKey
+    baseCtx || cachedIdentity || options.dispatchChannel || sessionKey
       ? {
           ...baseCtx,
           sessionKey: baseCtx?.sessionKey || sessionKey,
           agentId: baseCtx?.agentId || parsedSession.agentId,
           messageProvider:
-            baseCtx?.messageProvider ?? cachedIdentity?.messageProvider,
-          channelId: baseCtx?.channelId ?? cachedIdentity?.channelId,
-          senderId:
-            baseCtx?.senderId ||
-            cachedIdentity?.senderId ||
-            options.senderIdHint,
+            normalizeNonEmptyString(baseCtx?.messageProvider) ??
+            normalizeNonEmptyString(baseCtx?.channel) ??
+            cachedIdentity?.messageProvider,
+          channelId:
+            normalizeNonEmptyString(baseCtx?.channelId) ??
+            cachedIdentity?.channelId,
+          senderId: baseHostSenderConflict
+            ? baseTrustedSenderId
+            : baseTrustedSenderId || cachedIdentity?.senderId,
         }
       : undefined;
   const resolvedCtx = resolveSessionIdentity(
@@ -1894,9 +2303,25 @@ export function resolveAndCacheIdentity(
     return { effectiveCtx, resolvedCtx, skipReason };
   }
 
+  const preSynthesisTrustedSenderId =
+    !hasConflictingHostSenderId(resolvedCtx) &&
+    resolvedCtx?.senderId &&
+    resolvedCtx.senderId !== "anonymous"
+      ? resolvedCtx.senderId
+      : undefined;
   const { resolvedCtx: identityCtx, reason: skipReason } =
     getIdentitySkipReason(resolvedCtx, options.pluginConfig);
-  cacheSessionIdentity(sessionKey, identityCtx);
+  if (skipReason?.kind !== "final") {
+    cacheSessionIdentity(sessionKey, {
+      senderId: preSynthesisTrustedSenderId,
+      messageProvider:
+        identityCtx?.messageProvider &&
+        identityCtx.messageProvider !== "unknown"
+          ? identityCtx.messageProvider
+          : undefined,
+      channelId: identityCtx?.channelId,
+    });
+  }
   if (sessionKey) {
     if (skipReason) {
       setCappedMapValue(skipHindsightTurnBySession, sessionKey, skipReason);
@@ -1916,6 +2341,12 @@ export function getIdentitySkipReason(
   reason?: IdentitySkipReason;
 } {
   const resolvedCtx = resolveSessionIdentity(ctx);
+  if (hasConflictingHostSenderId(resolvedCtx)) {
+    return {
+      resolvedCtx,
+      reason: finalSkipReason("conflicting host sender identity"),
+    };
+  }
   const sessionKey = resolvedCtx?.sessionKey;
   // The "internal main" / "operational provider main" / "anonymous sender" filters
   // exist to keep the default multi-tenant bank from being polluted by CLI/main
@@ -1927,8 +2358,10 @@ export function getIdentitySkipReason(
   //     named bank and wants every session retained into it
   // When dynamicBankGranularity is unset, the default is ["agent","channel","user"]
   // which includes "agent", so agentBanking defaults to true to match deriveBankId.
-  const agentBanking =
-    pluginConfig?.dynamicBankGranularity?.includes("agent") ?? true;
+  const granularity = pluginConfig?.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+  const agentBanking = granularity.includes("agent");
   const staticBanking =
     pluginConfig?.dynamicBankId === false &&
     typeof pluginConfig?.bankId === "string" &&
@@ -1939,6 +2372,17 @@ export function getIdentitySkipReason(
     pluginConfig !== undefined &&
     mappedBankIdForAgent(resolvedCtx, pluginConfig) !== undefined;
   const allowCliSessions = agentBanking || staticBanking || mappedBanking;
+  const userScopedBanking =
+    pluginConfig?.dynamicBankId !== false &&
+    !mappedBanking &&
+    granularity.includes("user");
+  // Never invent an ambient `agent-user:<agentId>` sender on a user-scoped
+  // external channel turn whose trusted sender identity is missing (#11).
+  const canSynthesizeAgentSender =
+    staticBanking ||
+    mappedBanking ||
+    (allowCliSessions &&
+      (!userScopedBanking || isOperationalOrAgentSession(resolvedCtx)));
 
   if (typeof sessionKey === "string") {
     if (!allowCliSessions && /^agent:[^:]+:main$/.test(sessionKey)) {
@@ -1973,7 +2417,7 @@ export function getIdentitySkipReason(
     };
   }
   if (!resolvedCtx?.senderId || resolvedCtx.senderId === "anonymous") {
-    if (allowCliSessions && resolvedCtx?.agentId) {
+    if (canSynthesizeAgentSender && resolvedCtx?.agentId) {
       resolvedCtx.senderId = `agent-user:${resolvedCtx.agentId}`;
     } else {
       return {
@@ -2365,45 +2809,182 @@ export interface KnowledgeToolBankResolution {
   identityError?: string;
 }
 
+function validateMemoryAudienceForToolContext(
+  audience: MemoryAudience | undefined,
+  ctxAgentId: string | undefined,
+  ctxSessionKey: string | undefined,
+): string | undefined {
+  if (audience === undefined) return undefined;
+  if (!audience || typeof audience !== "object") {
+    return "Hindsight knowledge tools skipped: malformed memoryAudience.";
+  }
+  const audienceAgentId = normalizeNonEmptyString(audience.agentId);
+  if (!audienceAgentId) {
+    return "Hindsight knowledge tools skipped: memoryAudience is missing agentId.";
+  }
+  if (ctxAgentId && ctxAgentId !== audienceAgentId) {
+    return "Hindsight knowledge tools skipped: memoryAudience agent does not match tool context agent.";
+  }
+  const parsedCtxAgentId = ctxSessionKey
+    ? parseSessionKey(ctxSessionKey).agentId
+    : undefined;
+  if (parsedCtxAgentId && parsedCtxAgentId !== audienceAgentId) {
+    return "Hindsight knowledge tools skipped: memoryAudience agent does not match session key agent.";
+  }
+  if (audience.kind === "owner-private") {
+    return undefined;
+  }
+  if (audience.kind === "conversation") {
+    if (!ctxSessionKey) {
+      return "Hindsight knowledge tools skipped: conversation memoryAudience requires an active session context.";
+    }
+    const audienceSessionKey = normalizeNonEmptyString(audience.sessionKey);
+    const audienceSessionId = normalizeNonEmptyString(audience.sessionId);
+    if (!audienceSessionKey || !audienceSessionId) {
+      return "Hindsight knowledge tools skipped: conversation memoryAudience is missing sessionKey or sessionId.";
+    }
+    const parsedAudienceAgentId = parseSessionKey(audienceSessionKey).agentId;
+    if (parsedAudienceAgentId && parsedAudienceAgentId !== audienceAgentId) {
+      return "Hindsight knowledge tools skipped: conversation memoryAudience sessionKey does not match its agentId.";
+    }
+    return undefined;
+  }
+  return "Hindsight knowledge tools skipped: unsupported memoryAudience kind.";
+}
+
 /**
- * Resolve the Hindsight bank for knowledge tools using the same identity path as
- * auto-recall/retain. When user-scoped dynamic banking is enabled, unresolved
- * identity must not silently route to the shared default or anonymous bank.
+ * Resolve the Hindsight bank for knowledge tools using host-prepared authority
+ * (`memoryAudience` for session turns, explicit host fields for non-session
+ * invocations, and explicit static/`agentBankMap` sharing policies).
  */
 export function resolveBankIdForKnowledgeTools(
   toolCtx: OpenClawPluginToolContext,
   pluginConfig: PluginConfig,
 ): KnowledgeToolBankResolution {
-  const hookCtx: PluginHookAgentContext = {
-    agentId: toolCtx.agentId,
-    sessionKey: toolCtx.sessionKey,
-    workspaceDir: toolCtx.workspaceDir,
-    senderId: toolCtx.requesterSenderId,
-    messageProvider: toolCtx.messageChannel ?? toolCtx.deliveryContext?.channel,
-    channelId: toolCtx.nativeChannelId ?? toolCtx.deliveryContext?.to,
-  };
+  const ctxAgentId = normalizeNonEmptyString(toolCtx.agentId);
+  const ctxSessionKey = normalizeNonEmptyString(toolCtx.sessionKey);
+  const audience = toolCtx.memoryAudience;
+  const fallbackBankId = deriveBankId({ agentId: ctxAgentId }, pluginConfig);
 
-  // An explicitly mapped agent needs no identity resolution: its bank does not
-  // depend on the sender, so the user-scoped guards below must not reject it. (#3890)
-  const mappedBankId = mappedBankIdForAgent(hookCtx, pluginConfig);
+  const audienceValidationError = validateMemoryAudienceForToolContext(
+    audience,
+    ctxAgentId,
+    ctxSessionKey,
+  );
+  if (audienceValidationError) {
+    return {
+      bankId: fallbackBankId,
+      resolvedCtx: undefined,
+      identityError: audienceValidationError,
+    };
+  }
+
+  // Deliberate `agentBankMap` sharing policy: an explicitly mapped agent's bank
+  // is named by the operator and does not depend on session/user partitioning. (#3890)
+  const candidateAgentId =
+    normalizeNonEmptyString(audience?.agentId) ??
+    ctxAgentId ??
+    (ctxSessionKey ? parseSessionKey(ctxSessionKey).agentId : undefined);
+  const mappedBankId = mappedBankIdForAgent(
+    candidateAgentId ? { agentId: candidateAgentId } : undefined,
+    pluginConfig,
+  );
   if (mappedBankId) {
     return { bankId: mappedBankId, resolvedCtx: undefined };
   }
 
+  // Deliberate static-bank sharing policy: all traffic targets the configured bank.
   if (usesStaticBank(pluginConfig)) {
     return { bankId: getStaticBankId(pluginConfig), resolvedCtx: undefined };
   }
 
-  const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
-    sessionKey: toolCtx.sessionKey,
-    ctx: hookCtx,
-    pluginConfig,
-  });
-  const { reason: identityReason } = getIdentitySkipReason(
-    resolvedCtx,
-    pluginConfig,
-  );
-  const effectiveSkip = skipReason ?? identityReason;
+  const granularity = pluginConfig.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+
+  let resolvedCtx: PluginHookAgentContext | undefined;
+  let effectiveSkip: IdentitySkipReason | undefined;
+
+  if (ctxSessionKey) {
+    // Session turns require a host-prepared `memoryAudience` for dynamic bank
+    // derivation; never infer memory authority from `sessionKey` patterns alone. (#13)
+    if (!audience) {
+      return {
+        bankId: fallbackBankId,
+        resolvedCtx: undefined,
+        identityError:
+          "Hindsight knowledge tools skipped: missing host-prepared memoryAudience for session dynamic bank routing. " +
+          "Configure static banking (dynamicBankId: false + bankId) or agentBankMap if shared bank access without a session memory audience is intended.",
+      };
+    }
+
+    const authorizedSessionKey =
+      audience.kind === "conversation"
+        ? normalizeNonEmptyString(audience.sessionKey)!
+        : ctxSessionKey;
+    const hookCtx: PluginHookAgentContext = {
+      agentId: normalizeNonEmptyString(audience.agentId),
+      sessionKey: authorizedSessionKey,
+      workspaceDir: toolCtx.workspaceDir,
+      senderId: normalizeNonEmptyString(toolCtx.requesterSenderId),
+      messageProvider:
+        normalizeNonEmptyString(toolCtx.messageChannel) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.channel),
+      channelId:
+        normalizeNonEmptyString(toolCtx.nativeChannelId) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.to),
+    };
+    const identityResolution = resolveAndCacheIdentity({
+      sessionKey: authorizedSessionKey,
+      ctx: hookCtx,
+      pluginConfig,
+    });
+    resolvedCtx = identityResolution.resolvedCtx;
+    const { reason: identityReason } = getIdentitySkipReason(
+      resolvedCtx,
+      pluginConfig,
+    );
+    effectiveSkip = identityResolution.skipReason ?? identityReason;
+  } else {
+    // Non-session tool invocations (e.g. standalone authenticated RPC/CLI runs
+    // guarded by V2 `assertInvocationCurrent`) have no session turn and therefore
+    // no `memoryAudience`; route strictly from explicit host-provided tool fields.
+    const hookCtx: PluginHookAgentContext = {
+      agentId: normalizeNonEmptyString(audience?.agentId) ?? ctxAgentId,
+      workspaceDir: toolCtx.workspaceDir,
+      senderId: normalizeNonEmptyString(toolCtx.requesterSenderId),
+      messageProvider:
+        normalizeNonEmptyString(toolCtx.messageChannel) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.channel),
+      channelId:
+        normalizeNonEmptyString(toolCtx.nativeChannelId) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.to),
+    };
+    const identityResolution = getIdentitySkipReason(hookCtx, pluginConfig);
+    resolvedCtx = identityResolution.resolvedCtx;
+    effectiveSkip = identityResolution.reason;
+
+    if (granularity.includes("agent") && !resolvedCtx?.agentId) {
+      return {
+        bankId: fallbackBankId,
+        resolvedCtx,
+        identityError:
+          "Hindsight knowledge tools skipped: missing agent identity for non-session dynamic bank routing.",
+      };
+    }
+    if (
+      !usesUserScopedBanking(pluginConfig) &&
+      effectiveSkip &&
+      (granularity.includes("provider") || granularity.includes("channel"))
+    ) {
+      return {
+        bankId: deriveBankId(resolvedCtx, pluginConfig),
+        resolvedCtx,
+        identityError: `Hindsight knowledge tools skipped: ${formatIdentitySkipReason(effectiveSkip)}.`,
+      };
+    }
+  }
+
   const bankId = deriveBankId(resolvedCtx, pluginConfig);
 
   if (usesUserScopedBanking(pluginConfig)) {
@@ -3384,6 +3965,23 @@ function registerPlugin(api: OpenClawPluginApi) {
           (parsedProvider === "main" ? undefined : parsedProvider);
         // Without a known provider, let the prompt hook complete the identity.
         if (!dispatchChannel) return;
+        const eventSenderId = normalizeNonEmptyString(event?.senderId);
+        const ctxSenderId = normalizeNonEmptyString(ctx?.senderId);
+        if (eventSenderId && ctxSenderId && eventSenderId !== ctxSenderId) {
+          const conflictReason = finalSkipReason(
+            "conflicting host sender identity",
+          );
+          setCappedMapValue(
+            skipHindsightTurnBySession,
+            sessionKey,
+            conflictReason,
+          );
+          debug(
+            `[Hindsight] before_dispatch marked session ${sessionKey} to skip this turn: ${formatIdentitySkipReason(conflictReason)}`,
+          );
+          logSkipOnce("dispatch", sessionKey, conflictReason);
+          return;
+        }
         const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
           sessionKey,
           // Dispatch channelId names the provider, unlike the agent context's
@@ -3392,10 +3990,7 @@ function registerPlugin(api: OpenClawPluginApi) {
           ctx: {
             sessionKey,
             messageProvider: dispatchChannel,
-            senderId:
-              (typeof event?.senderId === "string"
-                ? event.senderId
-                : undefined) || ctx?.senderId,
+            senderId: eventSenderId ?? ctxSenderId,
           },
           dispatchChannel,
           pluginConfig,
@@ -3426,10 +4021,9 @@ function registerPlugin(api: OpenClawPluginApi) {
     // No `before_agent_start` registration: the callback used to call
     // `resolveAndCacheIdentity()` and emit a debug log, but `before_dispatch`
     // already populates the identity cache earlier in the inbound path,
-    // `before_prompt_build` re-resolves before recall (and can infer
-    // `senderId` from prompt content when ctx is missing it), and `agent_end`
-    // re-resolves before retain. Subscribing here was duplicate work on the
-    // hot path. (#1354)
+    // `before_prompt_build` re-resolves from trusted host context/cache before
+    // recall, and `agent_end` re-resolves before retain. Subscribing here was
+    // duplicate work on the hot path. (#1354)
 
     // Auto-recall: Inject relevant memories before agent processes the message
     // The SDK supplies prepared messages and the current request separately.
@@ -3488,16 +4082,12 @@ function registerPlugin(api: OpenClawPluginApi) {
           return;
         }
 
-        const senderIdFromPrompt = !ctx?.senderId
-          ? extractSenderIdFromText(event.prompt)
-          : undefined;
         const {
           resolvedCtx: resolvedCtxForRecall,
           skipReason: identitySkipReason,
         } = resolveAndCacheIdentity({
           sessionKey: sessionKeyForCache,
           ctx,
-          senderIdHint: senderIdFromPrompt,
           pluginConfig,
         });
         if (identitySkipReason) {
@@ -4211,67 +4801,123 @@ ${memoriesFormatted}
         })();
         const apiToken = pluginConfig.hindsightApiToken || undefined;
 
-        // Factory: called per session with agent context, returns tools scoped to that bank.
-        // Use host-supplied tool identity and the shared hook identity cache so
-        // explicit tools and automatic recall resolve the same per-user bank.
-        const factory = (ctx: OpenClawPluginToolContext) => {
-          const resolution = resolveBankIdForKnowledgeTools(ctx, pluginConfig);
-          const rawTools = createKnowledgeTools({
-            apiUrl,
-            apiToken,
-            bankId: resolution.bankId,
-          });
-          const rawToolsByName = new Map(rawTools.map((t) => [t.name, t]));
+        const catalogTools = createKnowledgeTools({
+          apiUrl,
+          apiToken,
+          bankId: getDefaultBankId(pluginConfig),
+        });
+        const assertLiveToolAuthority = (
+          ctx: OpenClawPluginToolContext<2>,
+        ): void => {
+          if (typeof ctx.assertInvocationCurrent !== "function") {
+            throw new Error(
+              "Plugin tool invocation authority is unavailable outside an admitted run or request",
+            );
+          }
+          ctx.assertInvocationCurrent();
+          ctx.assertMemoryAudienceCurrent?.();
+        };
 
-          const pageTool: AnyAgentTool = {
-            name: KNOWLEDGE_PAGE_TOOL_DEFINITION.name,
-            label: KNOWLEDGE_PAGE_TOOL_DEFINITION.label,
-            description: KNOWLEDGE_PAGE_TOOL_DEFINITION.description,
-            parameters: KNOWLEDGE_PAGE_TOOL_DEFINITION.parameters,
-            async execute(_id: string, params: Record<string, unknown>) {
+        // V2 tool factory: `create(ctx)` can run during metadata-only catalog
+        // inspection when no admitted invocation is active, so live authority
+        // checks and bank resolution run inside `execute()` across initialization,
+        // synchronous HTTP transport dispatch (including retries), and result
+        // release. (#13)
+        const factory: OpenClawPluginToolFactory<2> = {
+          contextVersion: 2,
+          create(ctx: OpenClawPluginToolContext<2>) {
+            const executeAuthorized = async (
+              runOperation: (
+                rawToolsByName: Map<string, InvocationKnowledgeDelegate>,
+              ) => Promise<InvocationKnowledgeToolResult>,
+            ) => {
+              const guard = createAuthorityGuardHandle(() =>
+                assertLiveToolAuthority(ctx),
+              );
+              guard.assertAuthority();
+              const config = currentPluginConfig || pluginConfig;
+              const resolution = resolveBankIdForKnowledgeTools(ctx, config);
               if (resolution.identityError) {
                 return {
-                  content: [{ type: "text", text: resolution.identityError }],
+                  content: [
+                    { type: "text" as const, text: resolution.identityError },
+                  ],
                   details: { error: resolution.identityError },
                 };
               }
-              const config = currentPluginConfig || pluginConfig;
-              await ensureBankDefaultsApplied(resolution.bankId, config);
-              const result = await executeKnowledgePageAction(
-                rawToolsByName,
-                params,
-              );
+              const ext = detectExternalApi(config);
+              const activeApiUrl =
+                ext.apiUrl ||
+                hindsightServer?.getBaseUrl() ||
+                `http://localhost:${config.apiPort || 9077}`;
+              const activeApiToken =
+                ext.apiToken || config.hindsightApiToken || undefined;
+              const { invocationClient, rawToolsByName } =
+                createInvocationKnowledgeTools({
+                  apiUrl: activeApiUrl,
+                  apiToken: activeApiToken,
+                  bankId: resolution.bankId,
+                  userAgent: USER_AGENT,
+                  guard,
+                });
+
+              await ensureBankDefaultsApplied(resolution.bankId, config, {
+                assertAuthorityCurrent: guard.assertAuthority,
+                rethrowAuthorityError: guard.rethrowAuthorityError,
+                clientOverride: invocationClient,
+              });
+              guard.rethrowAuthorityError();
+              guard.assertAuthority();
+              let result: InvocationKnowledgeToolResult;
+              try {
+                result = await runOperation(rawToolsByName);
+              } catch (err) {
+                // Surface explicit invocation/audience revocation ahead of
+                // downstream transport or abort errors when revoked in flight.
+                guard.rethrowAuthorityError();
+                guard.assertAuthority();
+                throw err;
+              }
+              guard.rethrowAuthorityError();
+              guard.assertAuthority();
               return { ...result, details: knowledgeToolDetails(result) };
-            },
-          };
+            };
 
-          const memoryTools = rawTools
-            .filter((t) => KNOWLEDGE_TOOL_RENAMES[t.name])
-            .map((t): AnyAgentTool => {
-              const override = KNOWLEDGE_TOOL_RENAMES[t.name]!;
-              return {
-                name: override.name,
-                label: override.label ?? t.label,
-                description: override.description ?? t.description,
-                parameters: t.parameters,
-                async execute(_id: string, params: Record<string, unknown>) {
-                  if (resolution.identityError) {
-                    return {
-                      content: [
-                        { type: "text", text: resolution.identityError },
-                      ],
-                      details: { error: resolution.identityError },
-                    };
-                  }
-                  const config = currentPluginConfig || pluginConfig;
-                  await ensureBankDefaultsApplied(resolution.bankId, config);
-                  const result = await t.execute(params);
-                  return { ...result, details: knowledgeToolDetails(result) };
-                },
-              };
-            });
+            const pageTool: AnyAgentTool = {
+              name: KNOWLEDGE_PAGE_TOOL_DEFINITION.name,
+              label: KNOWLEDGE_PAGE_TOOL_DEFINITION.label,
+              description: KNOWLEDGE_PAGE_TOOL_DEFINITION.description,
+              parameters: KNOWLEDGE_PAGE_TOOL_DEFINITION.parameters,
+              async execute(_id: string, params: Record<string, unknown>) {
+                return await executeAuthorized((rawToolsByName) =>
+                  executeKnowledgePageAction(rawToolsByName, params),
+                );
+              },
+            };
 
-          return [...memoryTools, pageTool];
+            const memoryTools = catalogTools
+              .filter((t) => KNOWLEDGE_TOOL_RENAMES[t.name])
+              .map((t): AnyAgentTool => {
+                const override = KNOWLEDGE_TOOL_RENAMES[t.name]!;
+                return {
+                  name: override.name,
+                  label: override.label ?? t.label,
+                  description: override.description ?? t.description,
+                  parameters: t.parameters,
+                  async execute(_id: string, params: Record<string, unknown>) {
+                    return await executeAuthorized(async (rawToolsByName) => {
+                      const delegate = rawToolsByName.get(t.name);
+                      if (!delegate) {
+                        throw new Error(`Underlying tool ${t.name} not found`);
+                      }
+                      return await delegate.execute(params);
+                    });
+                  },
+                };
+              });
+
+            return [...memoryTools, pageTool];
+          },
         };
 
         api.registerTool(factory, {

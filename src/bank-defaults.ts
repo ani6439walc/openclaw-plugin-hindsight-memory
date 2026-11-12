@@ -1,4 +1,7 @@
-import type { HindsightClient } from "@vectorize-io/hindsight-client";
+import {
+  createClient,
+  type HindsightClient,
+} from "@vectorize-io/hindsight-client";
 import type { PluginConfig } from "./types.js";
 
 export type RetainExtractionMode =
@@ -131,6 +134,88 @@ export function hasConfiguredBankDefaults(config: PluginConfig): boolean {
   );
 }
 
+type InternalHeyApiClient = ReturnType<typeof createClient>;
+
+export interface AuthorityGuardHandle {
+  assertAuthority: () => void;
+  rethrowAuthorityError: () => void;
+  guardedFetch: typeof fetch;
+}
+
+/**
+ * Build an invocation-scoped authority guard whose `guardedFetch` re-validates
+ * live invocation and memory-audience authority synchronously immediately
+ * before dispatching `fetch`, closing the async gap inside SDK request
+ * preparation (`await beforeRequest(...)`) and across capacity retries.
+ */
+export function createAuthorityGuardHandle(
+  assertAuthorityCurrent: () => void,
+  baseFetch?: typeof fetch,
+): AuthorityGuardHandle {
+  let authorityError: unknown;
+  const assertAuthority = (): void => {
+    try {
+      assertAuthorityCurrent();
+    } catch (err) {
+      authorityError ??= err;
+      throw err;
+    }
+  };
+  const rethrowAuthorityError = (): void => {
+    if (authorityError !== undefined) {
+      throw authorityError;
+    }
+  };
+  const guardedFetch: typeof fetch = (input, init) => {
+    assertAuthority();
+    const dispatch = baseFetch ?? globalThis.fetch;
+    return dispatch(input, init).then((response) => {
+      assertAuthority();
+      return response;
+    });
+  };
+  return { assertAuthority, rethrowAuthorityError, guardedFetch };
+}
+
+/**
+ * Derive an invocation-scoped `HindsightClient` view backed by a transport
+ * that enforces `guard.assertAuthority()` synchronously before every `fetch`
+ * without mutating the source client.
+ */
+export function withAuthorityGuardedClient(
+  client: HindsightClient,
+  guard: AuthorityGuardHandle,
+): HindsightClient {
+  const innerClient = (client as unknown as { client?: InternalHeyApiClient })
+    .client;
+  if (typeof innerClient?.getConfig !== "function") {
+    throw new Error(
+      "HindsightClient internal transport is unavailable for authority guard injection",
+    );
+  }
+  const existingConfig = innerClient.getConfig();
+  const existingFetch = existingConfig.fetch as typeof fetch | undefined;
+  const transportFetch: typeof fetch =
+    existingFetch && existingFetch !== guard.guardedFetch
+      ? (input, init) => {
+          guard.assertAuthority();
+          return existingFetch(input, init).then((response) => {
+            guard.assertAuthority();
+            return response;
+          });
+        }
+      : guard.guardedFetch;
+  const guardedInnerClient = createClient({
+    ...existingConfig,
+    fetch: transportFetch,
+  });
+  return Object.assign(
+    Object.create(Object.getPrototypeOf(client)) as object,
+    client,
+    { client: guardedInnerClient },
+  ) as HindsightClient;
+}
+
 /**
  * Stamp configured missions and bank defaults onto a bank exactly once per
  * process lifetime (caller tracks the set). No-op when no defaults are configured.
@@ -139,6 +224,7 @@ export async function applyConfiguredBankDefaults(
   client: HindsightClient,
   bankId: string,
   config: PluginConfig,
+  assertAuthorityCurrent?: () => void,
 ): Promise<void> {
   const createPayload = buildCreateBankDefaults(config);
   const configUpdates = buildBankConfigApiUpdates(config);
@@ -150,18 +236,35 @@ export async function applyConfiguredBankDefaults(
     return;
   }
 
-  if (Object.keys(createPayload).length > 0) {
-    await client.createBank(bankId, createPayload);
-  }
+  const guard = assertAuthorityCurrent
+    ? createAuthorityGuardHandle(assertAuthorityCurrent)
+    : undefined;
+  const effectiveClient = guard
+    ? withAuthorityGuardedClient(client, guard)
+    : client;
 
-  if (Object.keys(configUpdates).length > 0) {
-    await client.updateBankConfig(bankId, {
-      // Older servers also accept an attributes wrapper. The SDK's narrower
-      // type must not change the payload accepted by existing plugin configs.
-      entityLabels: configUpdates.entity_labels as Parameters<
-        HindsightClient["updateBankConfig"]
-      >[1]["entityLabels"],
-      enableAutoConsolidation: configUpdates.enable_auto_consolidation,
-    });
+  try {
+    if (Object.keys(createPayload).length > 0) {
+      guard?.assertAuthority();
+      await effectiveClient.createBank(bankId, createPayload);
+    }
+
+    if (Object.keys(configUpdates).length > 0) {
+      guard?.assertAuthority();
+      await effectiveClient.updateBankConfig(bankId, {
+        // Older servers also accept an attributes wrapper. The SDK's narrower
+        // type must not change the payload accepted by existing plugin configs.
+        entityLabels: configUpdates.entity_labels as Parameters<
+          HindsightClient["updateBankConfig"]
+        >[1]["entityLabels"],
+        enableAutoConsolidation: configUpdates.enable_auto_consolidation,
+      });
+    }
+
+    guard?.rethrowAuthorityError();
+    guard?.assertAuthority();
+  } catch (err) {
+    guard?.rethrowAuthorityError();
+    throw err;
   }
 }
