@@ -2252,6 +2252,52 @@ describe("session identity helpers", () => {
     });
   });
 
+  it("resolves trusted sender identity from channelContext.sender.id (#11)", () => {
+    const result = getIdentitySkipReason({
+      sessionKey: "agent:main:feishu:group:oc_synthetic_group",
+      channel: "feishu",
+      channelContext: {
+        sender: { id: "ou_synthetic_trusted_sender" },
+        chat: { id: "oc_synthetic_group" },
+      },
+    });
+
+    expect(result.reason).toBeUndefined();
+    expect(result.resolvedCtx?.senderId).toBe("ou_synthetic_trusted_sender");
+    expect(result.resolvedCtx?.messageProvider).toBe("feishu");
+  });
+
+  it("rejects conflicting ctx.senderId and channelContext.sender.id (#11)", () => {
+    const result = getIdentitySkipReason({
+      sessionKey: "agent:main:discord:channel:synthetic-room",
+      messageProvider: "discord",
+      channelId: "channel:synthetic-room",
+      senderId: "synthetic-sender-a",
+      channelContext: {
+        sender: { id: "synthetic-sender-b" },
+      },
+    });
+
+    expect(result.reason).toEqual({
+      kind: "final",
+      detail: "conflicting host sender identity",
+    });
+  });
+
+  it("does not invent an agent-user sender on user-scoped external channel turns (#11)", () => {
+    const result = getIdentitySkipReason({
+      sessionKey: "agent:main:discord:channel:synthetic-room",
+      messageProvider: "discord",
+      channelId: "channel:synthetic-room",
+    });
+
+    expect(result.reason).toEqual({
+      kind: "retryable",
+      detail: "missing stable sender identity",
+    });
+    expect(result.resolvedCtx?.senderId).toBeUndefined();
+  });
+
   it("allows agent:*:main sessions through when agent banking is enabled", () => {
     const result = getIdentitySkipReason(
       { sessionKey: "agent:project-alpha:main" },

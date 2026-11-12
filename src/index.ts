@@ -1704,20 +1704,83 @@ export function extractTelegramDirectSenderId(
   return match?.[1];
 }
 
+function normalizeNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function hasConflictingHostSenderId(
+  ctx: PluginHookAgentContext | undefined,
+): boolean {
+  const directSenderId = normalizeNonEmptyString(ctx?.senderId);
+  const channelSenderId = normalizeNonEmptyString(
+    ctx?.channelContext?.sender?.id,
+  );
+  return Boolean(
+    directSenderId && channelSenderId && directSenderId !== channelSenderId,
+  );
+}
+
+function getTrustedHostSenderId(
+  ctx: PluginHookAgentContext | undefined,
+): string | undefined {
+  if (hasConflictingHostSenderId(ctx)) {
+    return normalizeNonEmptyString(ctx?.senderId);
+  }
+  return (
+    normalizeNonEmptyString(ctx?.senderId) ??
+    normalizeNonEmptyString(ctx?.channelContext?.sender?.id)
+  );
+}
+
+function isOperationalOrAgentSession(
+  ctx: PluginHookAgentContext | undefined,
+): boolean {
+  const sessionKey = ctx?.sessionKey;
+  if (typeof sessionKey === "string") {
+    if (/^agent:[^:]+:main$/.test(sessionKey)) return true;
+    if (
+      /^agent:[^:]+:(?:cron|heartbeat|subagent|dashboard):/.test(sessionKey)
+    ) {
+      return true;
+    }
+  }
+  const provider = ctx?.messageProvider;
+  return (
+    provider === "main" ||
+    provider === "cron" ||
+    provider === "heartbeat" ||
+    provider === "subagent" ||
+    provider === "cli"
+  );
+}
+
 export function resolveSessionIdentity(
   ctx: PluginHookAgentContext | undefined,
 ): PluginHookAgentContext | undefined {
   if (!ctx) return undefined;
 
   const sessionParsed = ctx.sessionKey ? parseSessionKey(ctx.sessionKey) : {};
-  const messageProvider = ctx.messageProvider || sessionParsed.provider;
-  const channelId = ctx.channelId || sessionParsed.channel;
+  const messageProvider =
+    normalizeNonEmptyString(ctx.messageProvider) ||
+    normalizeNonEmptyString(ctx.channel) ||
+    sessionParsed.provider;
+  const channelId =
+    normalizeNonEmptyString(ctx.channelId) ||
+    sessionParsed.channel ||
+    normalizeNonEmptyString(ctx.chatId) ||
+    normalizeNonEmptyString(ctx.channelContext?.chat?.id);
+  const hostSenderConflict = hasConflictingHostSenderId(ctx);
+  const hostSenderId = getTrustedHostSenderId(ctx);
   // direct:<id> channel ids carry the user id for any provider (telegram, msteams, …).
-  const senderId = ctx.senderId || extractTelegramDirectSenderId(channelId);
+  const senderId = hostSenderConflict
+    ? hostSenderId
+    : hostSenderId || extractTelegramDirectSenderId(channelId);
 
   return {
     ...ctx,
-    agentId: ctx.agentId || sessionParsed.agentId,
+    agentId: normalizeNonEmptyString(ctx.agentId) || sessionParsed.agentId,
     messageProvider,
     channelId,
     senderId,
@@ -1771,27 +1834,32 @@ function logSkipOnce(
 
 function cacheSessionIdentity(
   sessionKey: string | undefined,
-  resolvedCtx: PluginHookAgentContext | undefined,
+  trustedIdentity:
+    | {
+        senderId?: string;
+        messageProvider?: string;
+        channelId?: string;
+      }
+    | undefined,
 ): void {
-  if (!sessionKey || !resolvedCtx) return;
+  if (!sessionKey || !trustedIdentity) return;
   if (
-    !resolvedCtx.messageProvider &&
-    !resolvedCtx.channelId &&
-    !resolvedCtx.senderId
+    !trustedIdentity.messageProvider &&
+    !trustedIdentity.channelId &&
+    !trustedIdentity.senderId
   )
     return;
 
   setCappedMapValue(sessionIdentityBySession, sessionKey, {
-    senderId: resolvedCtx.senderId,
-    messageProvider: resolvedCtx.messageProvider,
-    channelId: resolvedCtx.channelId,
+    senderId: trustedIdentity.senderId,
+    messageProvider: trustedIdentity.messageProvider,
+    channelId: trustedIdentity.channelId,
   });
 }
 
 export interface ResolveAndCacheIdentityOptions {
   sessionKey?: string;
   ctx?: PluginHookAgentContext;
-  senderIdHint?: string;
   dispatchChannel?: string;
   pluginConfig?: PluginConfig;
 }
@@ -1811,6 +1879,8 @@ export function resolveAndCacheIdentity(
   const baseCtx =
     options.ctx ||
     (sessionKey ? ({ sessionKey } as PluginHookAgentContext) : undefined);
+  const baseHostSenderConflict = hasConflictingHostSenderId(baseCtx);
+  const baseTrustedSenderId = getTrustedHostSenderId(baseCtx);
   // Main and operational namespaces do not name the live dispatch surface.
   // Prefer the actual context/cache/dispatch provider over these fallbacks.
   const sessionProvider =
@@ -1819,22 +1889,21 @@ export function resolveAndCacheIdentity(
       ? parsedSession.provider
       : undefined;
   const effectiveCtx =
-    baseCtx ||
-    cachedIdentity ||
-    options.senderIdHint ||
-    options.dispatchChannel ||
-    sessionKey
+    baseCtx || cachedIdentity || options.dispatchChannel || sessionKey
       ? {
           ...baseCtx,
           sessionKey: baseCtx?.sessionKey || sessionKey,
           agentId: baseCtx?.agentId || parsedSession.agentId,
           messageProvider:
-            baseCtx?.messageProvider ?? cachedIdentity?.messageProvider,
-          channelId: baseCtx?.channelId ?? cachedIdentity?.channelId,
-          senderId:
-            baseCtx?.senderId ||
-            cachedIdentity?.senderId ||
-            options.senderIdHint,
+            normalizeNonEmptyString(baseCtx?.messageProvider) ??
+            normalizeNonEmptyString(baseCtx?.channel) ??
+            cachedIdentity?.messageProvider,
+          channelId:
+            normalizeNonEmptyString(baseCtx?.channelId) ??
+            cachedIdentity?.channelId,
+          senderId: baseHostSenderConflict
+            ? baseTrustedSenderId
+            : baseTrustedSenderId || cachedIdentity?.senderId,
         }
       : undefined;
   const resolvedCtx = resolveSessionIdentity(
@@ -1894,9 +1963,25 @@ export function resolveAndCacheIdentity(
     return { effectiveCtx, resolvedCtx, skipReason };
   }
 
+  const preSynthesisTrustedSenderId =
+    !hasConflictingHostSenderId(resolvedCtx) &&
+    resolvedCtx?.senderId &&
+    resolvedCtx.senderId !== "anonymous"
+      ? resolvedCtx.senderId
+      : undefined;
   const { resolvedCtx: identityCtx, reason: skipReason } =
     getIdentitySkipReason(resolvedCtx, options.pluginConfig);
-  cacheSessionIdentity(sessionKey, identityCtx);
+  if (skipReason?.kind !== "final") {
+    cacheSessionIdentity(sessionKey, {
+      senderId: preSynthesisTrustedSenderId,
+      messageProvider:
+        identityCtx?.messageProvider &&
+        identityCtx.messageProvider !== "unknown"
+          ? identityCtx.messageProvider
+          : undefined,
+      channelId: identityCtx?.channelId,
+    });
+  }
   if (sessionKey) {
     if (skipReason) {
       setCappedMapValue(skipHindsightTurnBySession, sessionKey, skipReason);
@@ -1916,6 +2001,12 @@ export function getIdentitySkipReason(
   reason?: IdentitySkipReason;
 } {
   const resolvedCtx = resolveSessionIdentity(ctx);
+  if (hasConflictingHostSenderId(resolvedCtx)) {
+    return {
+      resolvedCtx,
+      reason: finalSkipReason("conflicting host sender identity"),
+    };
+  }
   const sessionKey = resolvedCtx?.sessionKey;
   // The "internal main" / "operational provider main" / "anonymous sender" filters
   // exist to keep the default multi-tenant bank from being polluted by CLI/main
@@ -1927,8 +2018,10 @@ export function getIdentitySkipReason(
   //     named bank and wants every session retained into it
   // When dynamicBankGranularity is unset, the default is ["agent","channel","user"]
   // which includes "agent", so agentBanking defaults to true to match deriveBankId.
-  const agentBanking =
-    pluginConfig?.dynamicBankGranularity?.includes("agent") ?? true;
+  const granularity = pluginConfig?.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+  const agentBanking = granularity.includes("agent");
   const staticBanking =
     pluginConfig?.dynamicBankId === false &&
     typeof pluginConfig?.bankId === "string" &&
@@ -1939,6 +2032,17 @@ export function getIdentitySkipReason(
     pluginConfig !== undefined &&
     mappedBankIdForAgent(resolvedCtx, pluginConfig) !== undefined;
   const allowCliSessions = agentBanking || staticBanking || mappedBanking;
+  const userScopedBanking =
+    pluginConfig?.dynamicBankId !== false &&
+    !mappedBanking &&
+    granularity.includes("user");
+  // Never invent an ambient `agent-user:<agentId>` sender on a user-scoped
+  // external channel turn whose trusted sender identity is missing (#11).
+  const canSynthesizeAgentSender =
+    staticBanking ||
+    mappedBanking ||
+    (allowCliSessions &&
+      (!userScopedBanking || isOperationalOrAgentSession(resolvedCtx)));
 
   if (typeof sessionKey === "string") {
     if (!allowCliSessions && /^agent:[^:]+:main$/.test(sessionKey)) {
@@ -1973,7 +2077,7 @@ export function getIdentitySkipReason(
     };
   }
   if (!resolvedCtx?.senderId || resolvedCtx.senderId === "anonymous") {
-    if (allowCliSessions && resolvedCtx?.agentId) {
+    if (canSynthesizeAgentSender && resolvedCtx?.agentId) {
       resolvedCtx.senderId = `agent-user:${resolvedCtx.agentId}`;
     } else {
       return {
@@ -3384,6 +3488,23 @@ function registerPlugin(api: OpenClawPluginApi) {
           (parsedProvider === "main" ? undefined : parsedProvider);
         // Without a known provider, let the prompt hook complete the identity.
         if (!dispatchChannel) return;
+        const eventSenderId = normalizeNonEmptyString(event?.senderId);
+        const ctxSenderId = normalizeNonEmptyString(ctx?.senderId);
+        if (eventSenderId && ctxSenderId && eventSenderId !== ctxSenderId) {
+          const conflictReason = finalSkipReason(
+            "conflicting host sender identity",
+          );
+          setCappedMapValue(
+            skipHindsightTurnBySession,
+            sessionKey,
+            conflictReason,
+          );
+          debug(
+            `[Hindsight] before_dispatch marked session ${sessionKey} to skip this turn: ${formatIdentitySkipReason(conflictReason)}`,
+          );
+          logSkipOnce("dispatch", sessionKey, conflictReason);
+          return;
+        }
         const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
           sessionKey,
           // Dispatch channelId names the provider, unlike the agent context's
@@ -3392,10 +3513,7 @@ function registerPlugin(api: OpenClawPluginApi) {
           ctx: {
             sessionKey,
             messageProvider: dispatchChannel,
-            senderId:
-              (typeof event?.senderId === "string"
-                ? event.senderId
-                : undefined) || ctx?.senderId,
+            senderId: eventSenderId ?? ctxSenderId,
           },
           dispatchChannel,
           pluginConfig,
@@ -3426,10 +3544,9 @@ function registerPlugin(api: OpenClawPluginApi) {
     // No `before_agent_start` registration: the callback used to call
     // `resolveAndCacheIdentity()` and emit a debug log, but `before_dispatch`
     // already populates the identity cache earlier in the inbound path,
-    // `before_prompt_build` re-resolves before recall (and can infer
-    // `senderId` from prompt content when ctx is missing it), and `agent_end`
-    // re-resolves before retain. Subscribing here was duplicate work on the
-    // hot path. (#1354)
+    // `before_prompt_build` re-resolves from trusted host context/cache before
+    // recall, and `agent_end` re-resolves before retain. Subscribing here was
+    // duplicate work on the hot path. (#1354)
 
     // Auto-recall: Inject relevant memories before agent processes the message
     // The SDK supplies prepared messages and the current request separately.
@@ -3488,16 +3605,12 @@ function registerPlugin(api: OpenClawPluginApi) {
           return;
         }
 
-        const senderIdFromPrompt = !ctx?.senderId
-          ? extractSenderIdFromText(event.prompt)
-          : undefined;
         const {
           resolvedCtx: resolvedCtxForRecall,
           skipReason: identitySkipReason,
         } = resolveAndCacheIdentity({
           sessionKey: sessionKeyForCache,
           ctx,
-          senderIdHint: senderIdFromPrompt,
           pluginConfig,
         });
         if (identitySkipReason) {
