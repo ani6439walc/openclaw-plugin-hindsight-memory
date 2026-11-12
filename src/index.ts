@@ -1447,13 +1447,19 @@ function extractRetainedSender(
     ) {
       continue;
     }
-    if (
-      !block.json ||
-      typeof block.json !== "object" ||
-      Array.isArray(block.json)
-    )
+    let metadata = block.json;
+    if (metadata === undefined && newline >= 0) {
+      // Retain also accepts unfenced JSON envelopes. Keep this local so bank
+      // routing's separate metadata reader does not gain new identity inputs.
+      try {
+        metadata = JSON.parse(text.slice(newline + 1, block.end).trim());
+      } catch {
+        return undefined;
+      }
+    }
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
       return undefined;
-    const raw = (block.json as Record<string, unknown>).sender;
+    const raw = (metadata as Record<string, unknown>).sender;
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
     const sender: RetainedSender = {};
     for (const key of ["id", "name", "username"] as const) {

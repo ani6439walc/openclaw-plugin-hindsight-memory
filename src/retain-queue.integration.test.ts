@@ -358,6 +358,69 @@ describe("retain queue idempotent replay", () => {
   });
 });
 
+describe("per-message sender retention (#10)", () => {
+  it("preserves each sender through live queued session appends", async () => {
+    const queuePath = makeQueuePath();
+    const server = installFakeServer("supported");
+    const api = makeApi(queuePath, 1_000);
+    const service = api.service();
+    await service.start();
+    try {
+      const alice = { id: "alice-id", name: "Alice", username: "alice" };
+      const bob = { id: "bob-id", name: "Bob", username: "bob" };
+      const ctx = {
+        agentId: "main",
+        sessionKey: "agent:main:discord:channel:senders",
+        messageProvider: "discord",
+        channelId: "senders",
+        senderId: "document-sender",
+      };
+      for (const sender of [alice, bob, undefined]) {
+        await api.agentEnd()(
+          {
+            success: true,
+            messages: [
+              {
+                role: "user",
+                content: sender
+                  ? `Conversation info: ⟦openclaw:ctx⟧\n${JSON.stringify({ sender, chat_id: "discard-chat" })}\n\nRemember my subscription status.`
+                  : "My sender is unavailable.",
+              },
+            ],
+          },
+          ctx,
+        );
+      }
+      expect(server.retainBodies).toHaveLength(3);
+      const items = server.retainBodies.map(
+        (body) =>
+          (
+            body.items as Array<{
+              content: string;
+              metadata: Record<string, string>;
+              document_id: string;
+              update_mode: string;
+            }>
+          )[0],
+      );
+      expect(items.map((item) => JSON.parse(item.content)[0].sender)).toEqual([
+        alice,
+        bob,
+        undefined,
+      ]);
+      expect(
+        items.every((item) => item.metadata.sender_id === "document-sender"),
+      ).toBe(true);
+      expect(items[0].document_id).toBe(`openclaw:${ctx.sessionKey}`);
+      expect(new Set(items.map((item) => item.document_id)).size).toBe(1);
+      expect(items.every((item) => item.update_mode === "append")).toBe(true);
+      expect(JSON.stringify(items)).not.toContain("discard-chat");
+    } finally {
+      await service.stop();
+    }
+  });
+});
+
 describe("session_end flushes the un-retained tail (#4341)", () => {
   // The helper that reads the transcript has its own unit tests; this one pins the
   // wiring, which is where #1726's flush died: the hook fired, the guard above it
@@ -410,9 +473,17 @@ describe("session_end flushes the un-retained tail (#4341)", () => {
     // The host reader preserves the ended-session boundary without a JSONL file.
     const readTail = vi.fn().mockResolvedValue({
       messages: [
-        { role: "user", content: "First turn." },
+        {
+          role: "user",
+          content:
+            'Conversation info: ⟦openclaw:ctx⟧\n{"sender":{"id":"alice-id","name":"Alice"}}\n\nFirst turn.',
+        },
         { role: "assistant", content: "Noted." },
-        { role: "user", content: "The tail nobody retained." },
+        {
+          role: "user",
+          content:
+            'Conversation info: ⟦openclaw:ctx⟧\n{"sender":{"id":"bob-id","name":"Bob"}}\n\nThe tail nobody retained.',
+        },
         { role: "assistant", content: "Understood." },
       ],
       totalMessages: 4,
@@ -442,6 +513,19 @@ describe("session_end flushes the un-retained tail (#4341)", () => {
     expect(JSON.stringify(server.retainBodies[0])).toContain(
       "The tail nobody retained.",
     );
+    const item = (
+      server.retainBodies[0].items as Array<{ content: string }>
+    )[0];
+    expect(
+      JSON.parse(item.content).map(
+        (message: { sender?: unknown }) => message.sender,
+      ),
+    ).toEqual([
+      { id: "alice-id", name: "Alice" },
+      undefined,
+      { id: "bob-id", name: "Bob" },
+      undefined,
+    ]);
     await service.stop();
   });
 
