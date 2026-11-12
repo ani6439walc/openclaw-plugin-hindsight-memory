@@ -3270,7 +3270,7 @@ describe("getPluginConfig — retainContext", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveBankIdForKnowledgeTools — dynamic user-scoped banking (#2441)
+// resolveBankIdForKnowledgeTools — dynamic user-scoped banking & V2 authority (#2441, #13)
 // ---------------------------------------------------------------------------
 
 describe("resolveBankIdForKnowledgeTools", () => {
@@ -3279,14 +3279,21 @@ describe("resolveBankIdForKnowledgeTools", () => {
     bankIdPrefix: "nemoclaw_intel",
   };
 
-  it("uses trusted sender and channel fields from the official tool context", () => {
+  it("uses trusted sender and channel fields from the official tool context when memoryAudience is prepared", () => {
+    const sessionKey = "agent:main:discord:channel:contract-tools";
     const resolution = resolveBankIdForKnowledgeTools(
       {
         agentId: "main",
-        sessionKey: "agent:main:discord:channel:contract-tools",
+        sessionKey,
         requesterSenderId: "trusted-requester",
         messageChannel: "discord",
         nativeChannelId: "contract-tools",
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "main",
+          sessionKey,
+          sessionId: "sess-contract-tools",
+        },
       },
       userScopedConfig,
     );
@@ -3296,10 +3303,17 @@ describe("resolveBankIdForKnowledgeTools", () => {
 
   it("routes msteams direct sessions to the per-user bank, not shared defaults", () => {
     const userId = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const sessionKey = `agent:nemoclaw:msteams:direct:${userId}`;
     const resolution = resolveBankIdForKnowledgeTools(
       {
         agentId: "nemoclaw",
-        sessionKey: `agent:nemoclaw:msteams:direct:${userId}`,
+        sessionKey,
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "nemoclaw",
+          sessionKey,
+          sessionId: "sess-msteams-direct",
+        },
       },
       userScopedConfig,
     );
@@ -3312,10 +3326,17 @@ describe("resolveBankIdForKnowledgeTools", () => {
   });
 
   it("does not silently fall back to shared/default bank when user identity is missing", () => {
+    const sessionKey = "agent:nemoclaw:msteams:group:19:general@thread.tacv2";
     const resolution = resolveBankIdForKnowledgeTools(
       {
         agentId: "nemoclaw",
-        sessionKey: "agent:nemoclaw:msteams:group:19:general@thread.tacv2",
+        sessionKey,
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "nemoclaw",
+          sessionKey,
+          sessionId: "sess-msteams-group",
+        },
       },
       userScopedConfig,
     );
@@ -3353,16 +3374,127 @@ describe("resolveBankIdForKnowledgeTools", () => {
   });
 
   it("still guards an unmapped agent under the same config (#3890)", () => {
+    const sessionKey = "agent:nemoclaw:msteams:group:19:general@thread.tacv2";
     const resolution = resolveBankIdForKnowledgeTools(
       {
         agentId: "nemoclaw",
-        sessionKey: "agent:nemoclaw:msteams:group:19:general@thread.tacv2",
+        sessionKey,
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "nemoclaw",
+          sessionKey,
+          sessionId: "sess-nemoclaw-group",
+        },
       },
       { ...userScopedConfig, agentBankMap: { inbound: "ps-technology" } },
     );
 
     expect(resolution.identityError).toMatch(/missing stable sender identity/);
     expect(resolution.bankId).not.toBe("ps-technology");
+  });
+
+  it("rejects session dynamic bank routing when memoryAudience is missing, even on direct or cron session keys (#13)", () => {
+    const directDenied = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: "agent:nemoclaw:msteams:direct:user-stale-lineage",
+      },
+      userScopedConfig,
+    );
+    expect(directDenied.identityError).toMatch(
+      /missing host-prepared memoryAudience/,
+    );
+
+    const cronAgentDenied = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: "agent:nemoclaw:cron:daily-digest",
+      },
+      { dynamicBankGranularity: ["agent"], bankIdPrefix: "nemoclaw_intel" },
+    );
+    expect(cronAgentDenied.identityError).toMatch(
+      /missing host-prepared memoryAudience/,
+    );
+  });
+
+  it("supports owner-private memoryAudience and conversation-spawned subagent memoryAudience (#13)", () => {
+    const ownerRes = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        memoryAudience: {
+          kind: "owner-private",
+          agentId: "main",
+        },
+      },
+      {
+        dynamicBankGranularity: ["agent", "user"],
+        bankIdPrefix: "owner_bank",
+      },
+    );
+    expect(ownerRes.identityError).toBeUndefined();
+    expect(ownerRes.bankId).toBe("owner_bank-main::agent-user%3Amain");
+
+    const parentSessionKey = "agent:main:telegram:direct:889900";
+    const childSubagentRes = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:subagent:worker-child-1",
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "main",
+          sessionKey: parentSessionKey,
+          sessionId: "sess-parent-889900",
+        },
+      },
+      userScopedConfig,
+    );
+    expect(childSubagentRes.identityError).toBeUndefined();
+    expect(childSubagentRes.bankId).toBe("nemoclaw_intel-889900");
+  });
+
+  it("rejects mismatched memoryAudience agentId against tool context (#13)", () => {
+    const mismatch = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:discord:channel:general",
+        requesterSenderId: "user-1",
+        memoryAudience: {
+          kind: "owner-private",
+          agentId: "other-agent",
+        },
+      },
+      userScopedConfig,
+    );
+    expect(mismatch.identityError).toMatch(
+      /memoryAudience agent does not match tool context agent/,
+    );
+  });
+
+  it("supports non-session tool invocations using explicit host fields while still guarding missing sender (#13)", () => {
+    const allowedNonSession = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "main",
+        requesterSenderId: "rpc-caller-42",
+        messageChannel: "cli",
+        nativeChannelId: "direct-rpc",
+      },
+      userScopedConfig,
+    );
+    expect(allowedNonSession.identityError).toBeUndefined();
+    expect(allowedNonSession.bankId).toBe("nemoclaw_intel-rpc-caller-42");
+
+    const missingSenderNonSession = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "main",
+        messageChannel: "discord",
+        nativeChannelId: "room-1",
+      },
+      userScopedConfig,
+    );
+    expect(missingSenderNonSession.identityError).toMatch(
+      /missing stable sender identity/,
+    );
   });
 });
 

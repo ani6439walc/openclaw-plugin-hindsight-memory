@@ -139,6 +139,7 @@ export async function applyConfiguredBankDefaults(
   client: HindsightClient,
   bankId: string,
   config: PluginConfig,
+  assertAuthorityCurrent?: () => void,
 ): Promise<void> {
   const createPayload = buildCreateBankDefaults(config);
   const configUpdates = buildBankConfigApiUpdates(config);
@@ -151,10 +152,12 @@ export async function applyConfiguredBankDefaults(
   }
 
   if (Object.keys(createPayload).length > 0) {
+    assertAuthorityCurrent?.();
     await client.createBank(bankId, createPayload);
   }
 
   if (Object.keys(configUpdates).length > 0) {
+    assertAuthorityCurrent?.();
     await client.updateBankConfig(bankId, {
       // Older servers also accept an attributes wrapper. The SDK's narrower
       // type must not change the payload accepted by existing plugin configs.
@@ -164,4 +167,6 @@ export async function applyConfiguredBankDefaults(
       enableAutoConsolidation: configUpdates.enable_auto_consolidation,
     });
   }
+
+  assertAuthorityCurrent?.();
 }

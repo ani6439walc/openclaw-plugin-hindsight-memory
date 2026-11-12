@@ -3,12 +3,18 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginService,
   OpenClawPluginToolContext,
+  OpenClawPluginToolFactory,
 } from "openclaw/plugin-sdk/plugin-entry";
+
+export type MemoryAudience = NonNullable<
+  OpenClawPluginToolContext<2>["memoryAudience"]
+>;
 
 export type {
   OpenClawPluginApi,
   OpenClawPluginService,
   OpenClawPluginToolContext,
+  OpenClawPluginToolFactory,
 };
 
 // Infer hook contracts from the public registration API: the SDK does not

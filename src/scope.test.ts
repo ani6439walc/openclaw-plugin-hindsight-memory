@@ -12,7 +12,7 @@ import type {
 
 type SessionType = "cron" | "subagent" | "heartbeat";
 type Service = { stop(): Promise<void> };
-type ToolFactory = (ctx: OpenClawPluginToolContext) => Array<{
+type ToolFactory = (ctx: OpenClawPluginToolContext<2>) => Array<{
   name: string;
   execute(id: string, params: Record<string, unknown>): Promise<unknown>;
 }>;
@@ -129,7 +129,12 @@ function register(config: Record<string, unknown> = {}) {
       };
     },
     registerTool(factory) {
-      toolFactory = factory as ToolFactory;
+      expect(factory).toMatchObject({ contextVersion: 2 });
+      const descriptor = factory as {
+        contextVersion: 2;
+        create: ToolFactory;
+      };
+      toolFactory = (ctx) => descriptor.create(ctx);
     },
     on(name, handler) {
       if (name === "before_prompt_build") recall = handler;
@@ -399,6 +404,7 @@ it("keeps explicit tools usable when both automatic actions are globally skipped
   const tools = toolFactory!({
     agentId: "librarian",
     sessionKey: ordinaryContext.sessionKey,
+    assertInvocationCurrent() {},
   });
   expect(tools.map((tool) => tool.name)).toEqual(
     expect.arrayContaining([
