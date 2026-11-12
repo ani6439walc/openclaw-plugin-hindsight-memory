@@ -35,8 +35,16 @@ export interface BackfillSourceReader {
   close(): Promise<void>;
 }
 
+export interface BackfillSnapshotReader extends BackfillSourceReader {
+  selectStore(
+    agentId: string,
+    expectedPhysical: string,
+  ): Promise<{ storePath: string }>;
+}
+
 type BackfillWorkerOperation =
   | { operation: "prepare" }
+  | { operation: "select-store"; agentId: string; expectedPhysical: string }
   | { operation: "discover"; agentId: string; includeRetained: boolean }
   | { operation: "read"; source: SqliteBackfillSource }
   | { operation: "close" };
@@ -54,8 +62,9 @@ const CLOSE_TIMEOUT_MS = 5_000;
 
 export function createBackfillSnapshotReader(
   root: string,
-): BackfillSourceReader {
-  return createReader(root, true);
+  containerRoot: string,
+): BackfillSnapshotReader {
+  return createReader(root, true, containerRoot);
 }
 
 function privateScratchRoot(selectedRoot: string): string {
@@ -92,7 +101,8 @@ export function createBackfillSourceReader(
 function createReader(
   openclawRoot: string,
   snapshotMode: boolean,
-): BackfillSourceReader {
+  containerRoot?: string,
+): BackfillSnapshotReader {
   const root = resolve(openclawRoot);
   let child: ChildProcess | undefined;
   let scratchRoot: string | undefined;
@@ -173,6 +183,9 @@ function createReader(
           ...environment,
           OPENCLAW_STATE_DIR: root,
           OPENCLAW_CONFIG_PATH: join(root, "openclaw.json"),
+          ...(snapshotMode
+            ? { HINDSIGHT_BACKFILL_CONTAINER_ROOT: containerRoot }
+            : {}),
           ...(scratchRoot
             ? { HINDSIGHT_BACKFILL_SCRATCH_ROOT: scratchRoot }
             : {}),
@@ -247,6 +260,8 @@ function createReader(
 
   return {
     prepare: () => call({ operation: "prepare" }),
+    selectStore: (agentId, expectedPhysical) =>
+      call({ operation: "select-store", agentId, expectedPhysical }),
     discover: (agentId, includeRetained) =>
       call({ operation: "discover", agentId, includeRetained }),
     read: (source) => call({ operation: "read", source }),

@@ -121,7 +121,10 @@ describe("backfill source reader transport", () => {
     const before = { ...process.env };
     process.env.OPENCLAW_AGENT_DIR = "/private/source-agent";
     process.env.OPENCLAW_PROFILE = "private-profile";
-    const reader = createBackfillSnapshotReader("/synthetic/scratch");
+    const reader = createBackfillSnapshotReader(
+      "/synthetic/scratch",
+      "/synthetic",
+    );
     try {
       await reader.prepare();
       await reader.close();
@@ -133,6 +136,7 @@ describe("backfill source reader transport", () => {
         OPENCLAW_CONFIG_PATH: "/synthetic/scratch/openclaw.json",
         XDG_CONFIG_HOME: "/synthetic/scratch/config",
         TMPDIR: "/synthetic/scratch",
+        HINDSIGHT_BACKFILL_CONTAINER_ROOT: "/synthetic",
       });
       expect(options?.env).not.toHaveProperty("OPENCLAW_AGENT_DIR");
       expect(options?.env).not.toHaveProperty("OPENCLAW_PROFILE");

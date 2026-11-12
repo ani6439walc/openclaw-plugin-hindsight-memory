@@ -1,6 +1,8 @@
-import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { copyFile, mkdir, mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { DatabaseSync, backup } from "node:sqlite";
+import { constants } from "node:fs";
+import { mirrorBackfillPath } from "./backfill-snapshot-config.js";
 import type { BackfillUnavailable } from "./backfill-source.js";
 
 export type BackfillSnapshot = {
@@ -16,6 +18,7 @@ export function createBackfillSnapshots(scratchRoot: string) {
     Promise<BackfillSnapshot | BackfillUnavailable>
   >();
   const roots: string[] = [];
+  const materialized = new Map<string, Promise<string>>();
   let closed = false;
   return {
     async get(
@@ -58,9 +61,34 @@ export function createBackfillSnapshots(scratchRoot: string) {
       }
       return pending;
     },
+    async materialize(
+      snapshot: BackfillSnapshot,
+      originalPhysicalPath: string,
+    ): Promise<string> {
+      if (closed) throw new Error("Backfill snapshots are closed");
+      const destination = mirrorBackfillPath(
+        snapshot.root,
+        originalPhysicalPath,
+      );
+      let pending = materialized.get(destination);
+      if (!pending) {
+        pending = (async () => {
+          await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+          await copyFile(
+            snapshot.storePath,
+            destination,
+            constants.COPYFILE_EXCL,
+          );
+          return destination;
+        })();
+        materialized.set(destination, pending);
+      }
+      return pending;
+    },
     async close() {
       closed = true;
       await Promise.allSettled(snapshots.values());
+      await Promise.allSettled(materialized.values());
       await Promise.all(
         roots.map((root) => rm(root, { recursive: true, force: true })),
       );

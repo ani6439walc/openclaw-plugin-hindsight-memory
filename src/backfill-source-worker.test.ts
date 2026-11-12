@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBackfillWorkerService } from "./backfill-source-worker.js";
-import type { BackfillSourceReader } from "./backfill-source.js";
+import { mirrorBackfillPath } from "./backfill-snapshot-config.js";
+import type { BackfillSnapshotReader } from "./backfill-source.js";
 
 vi.mock("./backfill-projection.js", () => {
   class BackfillProjectionError extends Error {
@@ -40,7 +41,7 @@ afterEach(async () => {
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
-async function fixture(snapshotMode = false) {
+async function fixture(snapshotMode = false, claimStore = true) {
   const root = await mkdtemp(join(tmpdir(), "hindsight-worker-test-"));
   roots.push(root);
   const snapshotPath = join(root, "snapshot.sqlite");
@@ -65,13 +66,17 @@ async function fixture(snapshotMode = false) {
         ? { ok: false, error: "unrepresentable" }
         : { ok: true, value },
   );
-  const resolveStorePath = vi.fn(() => source.storePath);
-  const resolveSessionStoreBackupPaths = vi.fn(() => [
-    source.storePath,
-    "/synthetic/physical/custom.db",
-    "/synthetic/physical/custom.db-wal",
-    "/synthetic/physical/custom.db-shm",
-  ]);
+  const resolveStorePath = vi.fn((store?: string) => store ?? source.storePath);
+  const resolveSessionStoreBackupPaths = vi.fn(() =>
+    snapshotMode
+      ? [snapshotPath, `${snapshotPath}-wal`, `${snapshotPath}-shm`]
+      : [
+          source.storePath,
+          "/synthetic/physical/custom.db",
+          "/synthetic/physical/custom.db-wal",
+          "/synthetic/physical/custom.db-shm",
+        ],
+  );
   const corpus = vi.fn(async (): Promise<unknown> => []);
   const raw = vi.fn(async (): Promise<unknown> => [
     { type: "session", id: source.sessionId },
@@ -105,14 +110,17 @@ async function fixture(snapshotMode = false) {
         throw Error("Unsupported module");
     }
   });
-  const inner: BackfillSourceReader = {
+  const privateLogical = mirrorBackfillPath(root, source.storePath);
+  const stateRoot = mirrorBackfillPath(root, environment.OPENCLAW_STATE_DIR);
+  const inner: BackfillSnapshotReader = {
+    selectStore: vi.fn(async () => ({ storePath: privateLogical })),
     prepare: vi.fn(async () => ({
       pluginConfig: {},
       agentIds: ["main", "other"],
     })),
     discover: vi.fn(async () => ({
       status: "available",
-      sources: [{ ...source, storePath: snapshotPath }],
+      sources: [{ ...source, storePath: privateLogical }],
     })),
     read: vi.fn(async () => ({
       status: "available",
@@ -126,12 +134,16 @@ async function fixture(snapshotMode = false) {
       | { status: "unavailable"; reason: string }
     > => ({ status: "available", root, storePath: snapshotPath }),
   );
+  const materialize = vi.fn(async () =>
+    mirrorBackfillPath(root, "/synthetic/physical/custom.db"),
+  );
   const close = vi.fn(async () => {});
   const reader = vi.fn(() => inner);
   const selectedEnvironment = snapshotMode
     ? {
         OPENCLAW_STATE_DIR: root,
         OPENCLAW_CONFIG_PATH: join(root, "openclaw.json"),
+        HINDSIGHT_BACKFILL_CONTAINER_ROOT: root,
       }
     : environment;
   if (snapshotMode)
@@ -139,15 +151,23 @@ async function fixture(snapshotMode = false) {
       selectedEnvironment.OPENCLAW_CONFIG_PATH,
       JSON.stringify(config),
     );
+  if (snapshotMode)
+    await writeFile(snapshotPath, "private synthetic SQLite file");
+  const service = createBackfillWorkerService(
+    loadModule,
+    selectedEnvironment,
+    { snapshots: { get, materialize, close }, reader },
+    snapshotMode,
+  );
+  if (snapshotMode && claimStore)
+    await service.selectStore("main", snapshotPath);
   return {
+    materialize,
+    privateLogical,
+    stateRoot,
     selectedEnvironment,
     normalizeAgentIdStrict,
-    service: createBackfillWorkerService(
-      loadModule,
-      selectedEnvironment,
-      { snapshots: { get, close }, reader },
-      snapshotMode,
-    ),
+    service,
     config,
     root,
     snapshotPath,
@@ -203,11 +223,11 @@ describe("stock backfill original-root worker", () => {
       storePath: source.storePath,
     });
     const scratchConfig = JSON.parse(
-      await readFile(join(f.root, "openclaw.json"), "utf8"),
+      await readFile(join(f.stateRoot, "openclaw.json"), "utf8"),
     );
     expect(scratchConfig).toEqual({
       agents: { ownership: "explicit", entries: { main: {}, other: {} } },
-      session: { store: f.snapshotPath },
+      session: { store: f.privateLogical },
     });
     expect(f.corpus).not.toHaveBeenCalled();
     expect(f.raw).not.toHaveBeenCalled();
@@ -217,7 +237,7 @@ describe("stock backfill original-root worker", () => {
     });
     expect(f.inner.read).toHaveBeenCalledWith({
       ...source,
-      storePath: f.snapshotPath,
+      storePath: f.privateLogical,
     });
     expect(f.inner.discover).toHaveBeenCalledOnce();
     await f.service.close();
@@ -228,15 +248,15 @@ describe("stock backfill original-root worker", () => {
     const f = await fixture();
     vi.mocked(f.inner.discover).mockImplementation(async (agentId) => ({
       status: "available",
-      sources: [{ ...source, agentId, storePath: f.snapshotPath }],
+      sources: [{ ...source, agentId, storePath: f.privateLogical }],
     }));
     await f.service.discover("main", true);
     await f.service.discover("other", true);
     expect(f.reader).toHaveBeenCalledOnce();
     expect(f.inner.prepare).toHaveBeenCalledOnce();
-    expect(await readFile(join(f.root, "openclaw.json"), "utf8")).not.toContain(
-      "never-copy",
-    );
+    expect(
+      await readFile(join(f.stateRoot, "openclaw.json"), "utf8"),
+    ).not.toContain("never-copy");
     await f.service.close();
   });
   it("returns missing-store without original host reads so legacy scanning can continue", async () => {
@@ -270,12 +290,12 @@ describe("stock backfill original-root worker", () => {
     );
     await invalid.service.close();
   });
-  it("resolves a requested retired agent absent from configured roster and adds only its scratch identity", async () => {
+  it("resolves a requested retired agent without fabricating a configured roster identity", async () => {
     const f = await fixture();
     vi.mocked(f.inner.discover).mockResolvedValue({
       status: "available",
       sources: [
-        { ...source, agentId: "retired-worker", storePath: f.snapshotPath },
+        { ...source, agentId: "retired-worker", storePath: f.privateLogical },
       ],
     });
     expect(await f.service.discover("retired-worker", true)).toEqual({
@@ -287,12 +307,11 @@ describe("stock backfill original-root worker", () => {
       env: environment,
     });
     const config = JSON.parse(
-      await readFile(join(f.root, "openclaw.json"), "utf8"),
+      await readFile(join(f.stateRoot, "openclaw.json"), "utf8"),
     );
     expect(config.agents.entries).toEqual({
       main: {},
       other: {},
-      "retired-worker": {},
     });
     expect(config).not.toHaveProperty("privateSentinel");
     await f.service.close();
@@ -368,28 +387,63 @@ describe("isolated stock snapshot reader", () => {
     expect(f.get).not.toHaveBeenCalled();
     await f.service.close();
   });
-  it("extends an existing shared snapshot roster for a later retired agent and validates the scratch config", async () => {
+  it("allows a qualified retired agent without changing the original scratch roster", async () => {
     const f = await fixture(true);
-    await f.service.prepare();
-    f.readConfigFileSnapshot.mockImplementation(async () => ({
-      exists: true,
-      valid: true,
-      config: JSON.parse(await readFile(join(f.root, "openclaw.json"), "utf8")),
-    }));
+    await f.service.selectStore("retired-worker", f.snapshotPath);
     expect(await f.service.discover("retired-worker", true)).toEqual({
       status: "available",
       sources: [],
     });
-    const scratch = JSON.parse(
-      await readFile(join(f.root, "openclaw.json"), "utf8"),
-    );
-    expect(scratch.agents.entries["retired-worker"]).toEqual({});
-    expect(scratch).not.toHaveProperty("privateSentinel");
+    expect(f.config.agents.entries).toEqual({ main: {}, other: {} });
+    expect(f.readConfigFileSnapshot).toHaveBeenCalledOnce();
     expect(f.corpus).toHaveBeenCalledWith(
       "retired-worker",
-      expect.objectContaining({ config: scratch }),
+      expect.objectContaining({ config: f.config }),
     );
-    expect(f.get).not.toHaveBeenCalled();
+    await f.service.close();
+  });
+  it("refuses unselected, missing, mismatching and escaped targets before any corpus/raw host read", async () => {
+    const f = await fixture(true, false);
+    await expect(f.service.discover("main", true)).rejects.toThrow(
+      /not selected/,
+    );
+    await rm(f.snapshotPath);
+    await expect(f.service.selectStore("main", f.snapshotPath)).rejects.toThrow(
+      /missing or unavailable/,
+    );
+    await writeFile(f.snapshotPath, "private fixture");
+    const other = join(f.root, "other.sqlite");
+    f.resolveSessionStoreBackupPaths.mockReturnValue([
+      other,
+      `${other}-wal`,
+      `${other}-shm`,
+    ]);
+    await expect(f.service.selectStore("main", f.snapshotPath)).rejects.toThrow(
+      /does not match/,
+    );
+    await expect(
+      f.service.selectStore("main", "/original/source.sqlite"),
+    ).rejects.toThrow(/escaped/);
+    expect(f.corpus).not.toHaveBeenCalled();
+    expect(f.raw).not.toHaveBeenCalled();
+    await f.service.close();
+  });
+  it("rechecks resolver custody before each corpus/raw call after a successful selection", async () => {
+    const f = await fixture(true);
+    const other = join(f.root, "other.sqlite");
+    f.resolveSessionStoreBackupPaths.mockReturnValue([
+      other,
+      `${other}-wal`,
+      `${other}-shm`,
+    ]);
+    await expect(f.service.discover("main", true)).rejects.toThrow(
+      /does not match/,
+    );
+    await expect(
+      f.service.read({ ...source, storePath: f.snapshotPath }),
+    ).rejects.toThrow(/does not match/);
+    expect(f.corpus).not.toHaveBeenCalled();
+    expect(f.raw).not.toHaveBeenCalled();
     await f.service.close();
   });
 

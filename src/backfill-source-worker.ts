@@ -1,13 +1,25 @@
-import { resolve, join } from "node:path";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { isAbsolute, resolve, join } from "node:path";
+import {
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   createBackfillSnapshotReader,
   type BackfillSourceReader,
+  type BackfillSnapshotReader,
   type BackfillUnavailable,
   type SqliteBackfillSource,
 } from "./backfill-source.js";
+import {
+  buildBackfillSnapshotConfig,
+  insideBackfillContainer,
+} from "./backfill-snapshot-config.js";
 import { createBackfillSnapshots } from "./backfill-snapshot.js";
 import {
   projectBackfillTranscript,
@@ -19,8 +31,11 @@ import type { PluginConfig } from "./types.js";
 type ModuleLoader = (specifier: string) => Promise<unknown>;
 type Config = Record<string, unknown>;
 type Dependencies = {
-  snapshots: Pick<ReturnType<typeof createBackfillSnapshots>, "get" | "close">;
-  reader(root: string): BackfillSourceReader;
+  snapshots: Pick<
+    ReturnType<typeof createBackfillSnapshots>,
+    "get" | "materialize" | "close"
+  >;
+  reader(root: string, containerRoot: string): BackfillSnapshotReader;
 };
 class BackfillHostError extends Error {}
 function snapshotReaderFailure(
@@ -99,17 +114,18 @@ export function createBackfillWorkerService(
   environment: NodeJS.ProcessEnv,
   injected?: Dependencies,
   snapshotMode = false,
-): BackfillSourceReader {
+): BackfillSnapshotReader {
   const env = { ...environment };
   let closed = false;
   let ownedScratch: string | undefined;
   let dependencies: Dependencies | undefined = injected;
-  const readers = new Map<string, Promise<BackfillSourceReader>>();
-  const activeReaders = new Set<BackfillSourceReader>();
+  const readers = new Map<string, Promise<BackfillSnapshotReader>>();
+  const activeReaders = new Set<BackfillSnapshotReader>();
   const selected = new Map<
     string,
-    { logical: string; snapshotPath: string; reader: BackfillSourceReader }
+    { logical: string; snapshotPath: string; reader: BackfillSnapshotReader }
   >();
+  const claims = new Map<string, { logical: string; physical: string }>();
   let prepared:
     | Promise<{
         config: Config;
@@ -214,102 +230,123 @@ export function createBackfillWorkerService(
     )
       throw new BackfillHostError("Invalid backfill agent identity");
   }
-  async function snapshotConfig(agentId: string): Promise<Config> {
-    await validateAgentId(agentId);
-    const prepared = await prepare();
-    const agents = object(prepared.config.agents) ? prepared.config.agents : {};
-    const entries = object(agents.entries) ? agents.entries : {};
-    if (Object.hasOwn(entries, agentId)) return prepared.config;
-    // A shared snapshot may encounter a retired filesystem agent after its first reader starts.
-    // Extend only this scratch roster; public config validation remains the admission boundary.
-    const config = {
-      agents: { ownership: "explicit", entries: { ...entries, [agentId]: {} } },
-      session: prepared.config.session,
-    };
-    if (!identity(env.OPENCLAW_CONFIG_PATH))
-      throw new BackfillHostError(
-        "Missing backfill snapshot configuration path",
-      );
-    await writeFile(env.OPENCLAW_CONFIG_PATH, JSON.stringify(config), {
-      mode: 0o600,
-    });
-    const health = await publicModule("openclaw/plugin-sdk/health");
-    if (typeof health.readConfigFileSnapshot !== "function")
-      throw new BackfillHostError(
-        "Unsupported OpenClaw host: missing public config reader",
-      );
-    const snapshot: unknown = await health.readConfigFileSnapshot({
-      observe: false,
-      isolateEnv: true,
-      pluginValidation: "core-only",
-      recoverSuspicious: false,
-    });
-    if (
-      !object(snapshot) ||
-      snapshot.exists !== true ||
-      snapshot.valid !== true ||
-      !object(snapshot.config)
-    )
-      throw new BackfillHostError("Backfill snapshot configuration is invalid");
-    prepared.config = snapshot.config;
-    return prepared.config;
-  }
-  async function select(agentId: string) {
-    const cached = selected.get(agentId);
-    if (cached) return cached;
-    const { config, agentIds } = await prepare();
-    await validateAgentId(agentId);
+  async function storePaths(agentId: string) {
+    const { config } = await prepare();
     const runtime = await publicModule(
       "openclaw/plugin-sdk/session-store-runtime",
     );
+    const resolveStorePath = runtime.resolveStorePath;
+    const backupPaths = runtime.resolveSessionStoreBackupPaths;
     if (
-      typeof runtime.resolveStorePath !== "function" ||
-      typeof runtime.resolveSessionStoreBackupPaths !== "function"
+      typeof resolveStorePath !== "function" ||
+      typeof backupPaths !== "function"
     )
       throw new BackfillHostError(
         "Unsupported OpenClaw host: missing public store path resolver",
       );
     const session = object(config.session) ? config.session : {};
-    const logical: unknown = runtime.resolveStorePath(
+    const logical: unknown = resolveStorePath(
       typeof session.store === "string" ? session.store : undefined,
       { agentId, env },
     );
     if (!identity(logical))
       throw new BackfillHostError("Invalid OpenClaw session store path");
-    const family: unknown = runtime.resolveSessionStoreBackupPaths({
-      agentId,
-      storePath: logical,
-    });
+    if (
+      snapshotMode &&
+      (!identity(env.HINDSIGHT_BACKFILL_CONTAINER_ROOT) ||
+        !insideBackfillContainer(
+          env.HINDSIGHT_BACKFILL_CONTAINER_ROOT,
+          logical,
+        ))
+    )
+      throw new BackfillHostError(
+        "Backfill snapshot logical store escaped its private container",
+      );
+    const family: unknown = backupPaths({ agentId, storePath: logical });
     if (!Array.isArray(family) || !family.every(identity))
       throw new BackfillHostError("Invalid OpenClaw store backup paths");
-    // Identify SQLite's canonical base from the resolver's own sidecar family.
     const bases = family.filter(
       (path) =>
         family.includes(`${path}-wal`) && family.includes(`${path}-shm`),
     );
     if (bases.length !== 1)
       throw new BackfillHostError("Unable to resolve OpenClaw SQLite store");
+    return { logical, physical: bases[0], resolveStorePath };
+  }
+  async function verifyPrivateStore(
+    agentId: string,
+    requestedPhysical?: string,
+  ) {
+    if (!snapshotMode)
+      throw new BackfillHostError(
+        "Invalid backfill snapshot selection operation",
+      );
+    await validateAgentId(agentId);
+    const expectedPhysical = requestedPhysical ?? claims.get(agentId)?.physical;
+    if (!identity(expectedPhysical))
+      throw new BackfillHostError("Backfill snapshot store is not selected");
+    const container = env.HINDSIGHT_BACKFILL_CONTAINER_ROOT;
+    if (
+      !identity(container) ||
+      !isAbsolute(container) ||
+      !isAbsolute(expectedPhysical) ||
+      !insideBackfillContainer(container, expectedPhysical)
+    )
+      throw new BackfillHostError(
+        "Backfill snapshot target escaped its private container",
+      );
+    try {
+      const actualRoot = await realpath(container);
+      const actualFile = await realpath(expectedPhysical);
+      if (
+        !insideBackfillContainer(actualRoot, actualFile) ||
+        actualRoot === actualFile ||
+        !(await stat(actualFile)).isFile()
+      )
+        throw new Error("invalid private file");
+    } catch {
+      throw new BackfillHostError(
+        "Backfill snapshot target is missing or unavailable",
+      );
+    }
+    const resolved = await storePaths(agentId);
+    if (resolve(resolved.physical) !== resolve(expectedPhysical))
+      throw new BackfillHostError(
+        "Backfill snapshot resolver target does not match captured SQLite",
+      );
+    const claim = { logical: resolved.logical, physical: expectedPhysical };
+    if (requestedPhysical !== undefined) claims.set(agentId, claim);
+    return claim;
+  }
+  async function select(agentId: string) {
+    const cached = selected.get(agentId);
+    if (cached) return cached;
+    const { config } = await prepare();
+    await validateAgentId(agentId);
+    const original = await storePaths(agentId);
     const dependencies = await deps();
-    const snapshot = await dependencies.snapshots.get(bases[0]);
+    const snapshot = await dependencies.snapshots.get(original.physical);
     if (snapshot.status !== "available") return snapshot;
-    let pending = readers.get(snapshot.storePath);
+    const workingPath = await dependencies.snapshots.materialize(
+      snapshot,
+      original.physical,
+    );
+    const rebased = buildBackfillSnapshotConfig(
+      config,
+      env,
+      snapshot.root,
+      (store, options) => original.resolveStorePath(store, options),
+    );
+    let pending = readers.get(snapshot.root);
     if (!pending) {
       pending = (async () => {
-        const config = {
-          agents: {
-            ownership: "explicit",
-            entries: Object.fromEntries(
-              [...new Set([...agentIds, agentId])].map((id) => [id, {}]),
-            ),
-          },
-          session: { store: snapshot.storePath },
-        };
+        await mkdir(rebased.stateRoot, { recursive: true, mode: 0o700 });
         await writeFile(
-          join(snapshot.root, "openclaw.json"),
-          JSON.stringify(config),
+          join(rebased.stateRoot, "openclaw.json"),
+          JSON.stringify(rebased.config),
           { mode: 0o600 },
         );
-        const reader = dependencies.reader(snapshot.root);
+        const reader = dependencies.reader(rebased.stateRoot, snapshot.root);
         activeReaders.add(reader);
         try {
           await reader.prepare();
@@ -318,18 +355,34 @@ export function createBackfillWorkerService(
         }
         return reader;
       })();
-      readers.set(snapshot.storePath, pending);
+      readers.set(snapshot.root, pending);
     }
+    const reader = await pending;
+    let claim: { storePath: string };
+    try {
+      claim = await reader.selectStore(agentId, workingPath);
+    } catch (error) {
+      throw snapshotReaderFailure("selection", error);
+    }
+    if (
+      !object(claim) ||
+      !identity(claim.storePath) ||
+      !insideBackfillContainer(snapshot.root, claim.storePath)
+    )
+      throw new BackfillHostError(
+        "Invalid OpenClaw snapshot selection response",
+      );
     const result = {
-      logical,
-      snapshotPath: snapshot.storePath,
-      reader: await pending,
+      logical: original.logical,
+      snapshotPath: claim.storePath,
+      reader,
     };
     selected.set(agentId, result);
     return result;
   }
   async function snapshotDiscover(agentId: string, includeRetained: boolean) {
-    const config = await snapshotConfig(agentId);
+    await verifyPrivateStore(agentId);
+    const { config } = await prepare();
     const host = await publicModule(
       "openclaw/plugin-sdk/memory-core-host-engine-sessions",
     );
@@ -366,6 +419,10 @@ export function createBackfillWorkerService(
     return { status: "available" as const, sources };
   }
   return {
+    async selectStore(agentId, expectedPhysical) {
+      const claim = await verifyPrivateStore(agentId, expectedPhysical);
+      return { storePath: claim.logical };
+    },
     async prepare() {
       const { pluginConfig, agentIds } = await prepare();
       return { pluginConfig, agentIds };
@@ -408,9 +465,8 @@ export function createBackfillWorkerService(
           throw snapshotReaderFailure("transcript read", error);
         }
       }
-      const config = await snapshotConfig(source.agentId);
-      const session = object(config.session) ? config.session : {};
-      if (source.storePath !== session.store)
+      const claim = await verifyPrivateStore(source.agentId);
+      if (source.storePath !== claim.logical)
         throw new BackfillHostError("Backfill snapshot store identity changed");
       const runtime = await publicModule(
         "openclaw/plugin-sdk/session-store-runtime",
@@ -432,7 +488,7 @@ export function createBackfillWorkerService(
           ...(source.sessionKey !== undefined
             ? { sessionKey: source.sessionKey }
             : {}),
-          storePath: source.storePath,
+          storePath: claim.physical,
           env,
         });
         if (!Array.isArray(events))
@@ -487,6 +543,19 @@ function startWorker(): void {
         switch (request.operation) {
           case "prepare":
             value = await service.prepare();
+            break;
+          case "select-store":
+            if (
+              typeof request.agentId !== "string" ||
+              typeof request.expectedPhysical !== "string"
+            )
+              throw new BackfillHostError(
+                "Invalid backfill snapshot selection request",
+              );
+            value = await service.selectStore(
+              request.agentId,
+              request.expectedPhysical,
+            );
             break;
           case "discover":
             if (
