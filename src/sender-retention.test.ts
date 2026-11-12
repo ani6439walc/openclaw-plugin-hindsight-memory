@@ -3,6 +3,7 @@ import {
   configureSenderPrefixStripping,
   DEFAULT_RETAIN_CONTEXT,
   extractRecallQuery,
+  extractSenderIdFromText,
   prepareRetentionTranscript,
 } from "./index.js";
 
@@ -29,6 +30,71 @@ function envelope(sender: unknown, body: string, legacy = false): string {
 afterEach(() => configureSenderPrefixStripping(undefined));
 
 describe("per-message retain sender attribution", () => {
+  it.each(["not-json", "null", "[]", '{"sender":'])(
+    "leaves invalid unfenced metadata unknown (%s)",
+    (metadata) => {
+      const result = prepareRetentionTranscript(
+        [
+          {
+            role: "user",
+            content: `Conversation info: ⟦openclaw:ctx⟧\n${metadata}\n\nMy subscription is cancelled.`,
+          },
+        ],
+        {},
+      );
+      expect(JSON.parse(result!.transcript)).toEqual([
+        {
+          role: "user",
+          content: [{ type: "text", text: "My subscription is cancelled." }],
+        },
+      ]);
+    },
+  );
+
+  it("does not expand bank routing identity parsing for unfenced metadata", () => {
+    const content = `Conversation info: ⟦openclaw:ctx⟧\n${JSON.stringify({ sender: alice, sender_id: "routing-id" })}\n\nMy subscription is cancelled.`;
+    const result = prepareRetentionTranscript([{ role: "user", content }], {});
+    expect(JSON.parse(result!.transcript)[0].sender).toEqual(alice);
+    expect(extractSenderIdFromText(content)).toBeUndefined();
+  });
+
+  it.each([{}, { retainToolCalls: false }, { retainFormat: "text" as const }])(
+    "preserves unfenced Conversation info sender with %j",
+    (config) => {
+      const content = (sender: unknown, body: string) =>
+        `[Tue 2026-11-03 21:36 GMT+8] Conversation info: ⟦openclaw:ctx⟧\n${JSON.stringify({ sender, chat_id: "discard-chat" })}\n\n${body}`;
+      const result = prepareRetentionTranscript(
+        [
+          {
+            role: "user",
+            content: content(alice, "I cancelled my subscription."),
+          },
+          { role: "user", content: content(bob, "Mine is still active.") },
+          { role: "user", content: "My sender is unavailable." },
+        ],
+        config,
+        true,
+      );
+
+      expect(result!.transcript).not.toContain("discard-chat");
+      expect(result!.transcript).not.toContain("Conversation info");
+      if (config.retainFormat === "text") {
+        expect(result!.transcript).toContain(
+          `[sender: ${JSON.stringify(alice)}]`,
+        );
+        expect(result!.transcript).toContain(
+          `[sender: ${JSON.stringify(bob)}]`,
+        );
+        expect(result!.transcript.match(/\[sender:/g)).toHaveLength(2);
+      } else {
+        const retained = JSON.parse(result!.transcript);
+        expect(
+          retained.map((message: { sender?: unknown }) => message.sender),
+        ).toEqual([alice, bob, undefined]);
+      }
+    },
+  );
+
   it("preserves sender from the legacy envelope's outer fences", () => {
     const result = prepareRetentionTranscript(
       [
