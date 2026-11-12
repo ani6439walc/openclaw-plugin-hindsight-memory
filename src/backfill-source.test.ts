@@ -1,11 +1,17 @@
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fork } from "node:child_process";
-import { createBackfillSourceReader } from "./backfill-source.js";
+import {
+  createBackfillSourceReader,
+  createBackfillSnapshotReader,
+} from "./backfill-source.js";
 
 vi.mock("node:child_process", () => ({ fork: vi.fn() }));
 
 class SyntheticWorker extends EventEmitter {
+  pid?: number;
   connected = true;
   exitCode: number | null = null;
   signalCode: string | null = null;
@@ -46,6 +52,7 @@ class SyntheticWorker extends EventEmitter {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
@@ -82,6 +89,162 @@ describe("backfill source reader transport", () => {
     expect(child.operations).toEqual(["prepare", "discover", "close"]);
     expect(process.env).toEqual(before);
     await expect(reader.prepare()).rejects.toThrow(/closed/i);
+  });
+
+  it("keeps scratch outside a selected state root even when inherited TMPDIR points inside it", async () => {
+    const child = new SyntheticWorker();
+    vi.mocked(fork).mockReturnValue(
+      child as unknown as ReturnType<typeof fork>,
+    );
+    const previous = process.env.TMPDIR;
+    process.env.TMPDIR = "/tmp";
+    const reader = createBackfillSourceReader("/tmp");
+    try {
+      await reader.prepare();
+      const scratch =
+        vi.mocked(fork).mock.calls[0][2]?.env?.HINDSIGHT_BACKFILL_SCRATCH_ROOT;
+      expect(scratch).toMatch(/^\/var\/tmp\/hindsight-backfill-/);
+      await reader.close();
+      expect(scratch && existsSync(scratch)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+      await reader.close();
+    }
+  });
+
+  it("binds every snapshot selector before imports and excludes inherited source selectors", async () => {
+    const child = new SyntheticWorker();
+    vi.mocked(fork).mockReturnValue(
+      child as unknown as ReturnType<typeof fork>,
+    );
+    const before = { ...process.env };
+    process.env.OPENCLAW_AGENT_DIR = "/private/source-agent";
+    process.env.OPENCLAW_PROFILE = "private-profile";
+    const reader = createBackfillSnapshotReader(
+      "/synthetic/scratch",
+      "/synthetic",
+    );
+    try {
+      await reader.prepare();
+      await reader.close();
+      const [, args, options] = vi.mocked(fork).mock.calls[0];
+      expect(args).toEqual(["--snapshot-reader"]);
+      expect(options?.env).toMatchObject({
+        HOME: "/synthetic/scratch",
+        OPENCLAW_STATE_DIR: "/synthetic/scratch",
+        OPENCLAW_CONFIG_PATH: "/synthetic/scratch/openclaw.json",
+        XDG_CONFIG_HOME: "/synthetic/scratch/config",
+        TMPDIR: "/synthetic/scratch",
+        HINDSIGHT_BACKFILL_CONTAINER_ROOT: "/synthetic",
+      });
+      expect(options?.env).not.toHaveProperty("OPENCLAW_AGENT_DIR");
+      expect(options?.env).not.toHaveProperty("OPENCLAW_PROFILE");
+      expect(options?.detached).toBe(false);
+    } finally {
+      for (const key of Object.keys(process.env))
+        if (!(key in before)) delete process.env[key];
+      Object.assign(process.env, before);
+    }
+  });
+
+  it("reaps the outer process group before deleting its private snapshot directory", async () => {
+    const child = new SyntheticWorker();
+    child.pid = 9876543;
+    vi.mocked(fork).mockReturnValue(
+      child as unknown as ReturnType<typeof fork>,
+    );
+    let groupAlive = true;
+    let scratch: string | undefined;
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      expect(pid).toBe(-9876543);
+      expect(scratch && existsSync(scratch)).toBe(true);
+      if (signal === "SIGKILL") groupAlive = false;
+      if (!groupAlive && signal === 0)
+        throw Object.assign(Error("gone"), { code: "ESRCH" });
+      return true;
+    });
+    const reader = createBackfillSourceReader("/synthetic/original");
+    await reader.prepare();
+    scratch =
+      vi.mocked(fork).mock.calls[0][2]?.env?.HINDSIGHT_BACKFILL_SCRATCH_ROOT;
+    expect(scratch && existsSync(scratch)).toBe(true);
+    await reader.close();
+    expect(kill).toHaveBeenCalledWith(-9876543, "SIGKILL");
+    expect(scratch && existsSync(scratch)).toBe(false);
+  });
+
+  it("cleans private snapshots after an ignored SIGTERM and asynchronous SIGKILL exit/group retirement", async () => {
+    vi.useFakeTimers();
+    const child = new SyntheticWorker();
+    child.pid = 9876543;
+    vi.mocked(fork).mockReturnValue(
+      child as unknown as ReturnType<typeof fork>,
+    );
+    let scratch: string | undefined;
+    let groupAlive = true;
+    let killScheduled = false;
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      expect(pid).toBe(-9876543);
+      if (signal === 0 && !groupAlive)
+        throw Object.assign(Error("gone"), { code: "ESRCH" });
+      expect(scratch && existsSync(scratch)).toBe(true);
+      if (signal === "SIGKILL" && !killScheduled) {
+        killScheduled = true;
+        setTimeout(() => {
+          child.connected = false;
+          child.signalCode = "SIGKILL";
+          child.emit("exit", null, "SIGKILL");
+        }, 50);
+        setTimeout(() => {
+          groupAlive = false;
+        }, 100);
+      }
+      return true;
+    });
+    const reader = createBackfillSourceReader("/synthetic/original");
+    try {
+      await reader.prepare();
+      scratch =
+        vi.mocked(fork).mock.calls[0][2]?.env?.HINDSIGHT_BACKFILL_SCRATCH_ROOT;
+      if (!scratch) throw Error("missing private scratch directory");
+      writeFileSync(
+        join(scratch, "private-snapshot.sqlite"),
+        "private transcript fixture",
+      );
+      child.send = (request, callback) => {
+        callback?.(null);
+        queueMicrotask(() =>
+          child.emit("message", { id: request.id, ok: true }),
+        );
+        return true;
+      };
+      let finished = false;
+      const closed = reader.close().then(
+        () => undefined,
+        (error) => error,
+      );
+      void closed.then(() => {
+        finished = true;
+      });
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(kill).toHaveBeenCalledWith(-9876543, "SIGTERM");
+      expect(kill).toHaveBeenCalledWith(-9876543, "SIGKILL");
+      expect(finished).toBe(false);
+      expect(existsSync(scratch)).toBe(true);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(await closed).toEqual(
+        expect.objectContaining({
+          message: "OpenClaw backfill source worker did not exit",
+        }),
+      );
+      expect(child.signalCode).toBe("SIGKILL");
+      expect(groupAlive).toBe(false);
+      expect(existsSync(scratch)).toBe(false);
+    } finally {
+      // RED must not leave its deliberately stranded synthetic private artifact behind.
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
   });
 
   it("reports a worker exit and never starts a replacement child", async () => {
