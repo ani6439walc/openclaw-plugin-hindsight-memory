@@ -15,7 +15,12 @@ import type {
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
 import {
+  createClient,
+  createConfig,
+  DEFAULT_MAX_ATTEMPTS,
   HindsightClient,
+  retryOnCapacity,
+  sdk,
   type HindsightClientOptions,
   type MinScores,
 } from "@vectorize-io/hindsight-client";
@@ -159,11 +164,311 @@ export async function executeKnowledgePageAction<Result>(
 
 import {
   applyConfiguredBankDefaults,
+  createAuthorityGuardHandle,
   hasConfiguredBankDefaults,
   normalizeDispositionTrait,
   normalizeEntityLabels,
   normalizeRetainExtractionMode,
+  withAuthorityGuardedClient,
+  type AuthorityGuardHandle,
 } from "./bank-defaults.js";
+
+type KnowledgeFactType = "world" | "experience" | "observation";
+const KNOWLEDGE_FACT_TYPES: readonly KnowledgeFactType[] = [
+  "world",
+  "experience",
+  "observation",
+];
+const DEFAULT_KNOWLEDGE_RECALL_FACT_TYPES: readonly KnowledgeFactType[] = [
+  "world",
+  "experience",
+];
+const DEFAULT_KNOWLEDGE_REFLECT_FACT_TYPES: readonly KnowledgeFactType[] =
+  KNOWLEDGE_FACT_TYPES;
+const DEFAULT_KNOWLEDGE_RECALL_MAX_TOKENS = 1024;
+const KNOWLEDGE_PAGE_TRIGGER_DEFAULTS = {
+  mode: "delta" as const,
+  refresh_after_consolidation: true,
+  exclude_mental_models: true,
+  fact_types: ["observation" as const],
+};
+
+type InvocationKnowledgeToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+};
+
+type InvocationKnowledgeDelegate = {
+  execute: (
+    params: Record<string, unknown>,
+  ) => Promise<InvocationKnowledgeToolResult>;
+};
+
+function formatKnowledgeToolResult(
+  data: unknown,
+): InvocationKnowledgeToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+function normalizeKnowledgeFactTypes(
+  input: unknown,
+  defaultTypes: readonly KnowledgeFactType[],
+): KnowledgeFactType[] {
+  if (input === undefined || input === null) {
+    return [...defaultTypes];
+  }
+  const raw = Array.isArray(input)
+    ? input
+    : typeof input === "string"
+      ? input.split(/[\s,]+/).filter(Boolean)
+      : [];
+  const normalized = raw.filter(
+    (t): t is KnowledgeFactType =>
+      typeof t === "string" &&
+      (KNOWLEDGE_FACT_TYPES as readonly string[]).includes(t),
+  );
+  if (normalized.length !== raw.length || normalized.length === 0) {
+    throw new Error(
+      `Invalid fact_types/types. Expected one or more of: ${KNOWLEDGE_FACT_TYPES.join(", ")}`,
+    );
+  }
+  return [...new Set(normalized)];
+}
+
+function parseKnowledgeRecallMaxTokens(input: unknown): number {
+  if (input === undefined || input === null) {
+    return DEFAULT_KNOWLEDGE_RECALL_MAX_TOKENS;
+  }
+  const n = Math.floor(Number(input));
+  if (!Number.isFinite(n) || n < 1) {
+    return DEFAULT_KNOWLEDGE_RECALL_MAX_TOKENS;
+  }
+  return n;
+}
+
+function createInvocationKnowledgeTools(opts: {
+  apiUrl: string;
+  apiToken: string | undefined;
+  bankId: string;
+  userAgent: string;
+  guard: AuthorityGuardHandle;
+}): {
+  invocationClient: HindsightClient;
+  rawToolsByName: Map<string, InvocationKnowledgeDelegate>;
+} {
+  const baseClient = new HindsightClient({
+    baseUrl: opts.apiUrl,
+    apiKey: opts.apiToken,
+    userAgent: opts.userAgent,
+  });
+  const invocationClient = withAuthorityGuardedClient(baseClient, opts.guard);
+  const lowLevel = createClient(
+    createConfig({
+      baseUrl: opts.apiUrl,
+      headers: {
+        ...(opts.apiToken ? { Authorization: `Bearer ${opts.apiToken}` } : {}),
+        "User-Agent": opts.userAgent,
+      },
+      fetch: opts.guard.guardedFetch,
+    }),
+  );
+  const { bankId, guard } = opts;
+
+  const rawToolsByName = new Map<string, InvocationKnowledgeDelegate>([
+    [
+      "agent_knowledge_list_pages",
+      {
+        async execute() {
+          const resp = await sdk.listMentalModels({
+            client: lowLevel,
+            path: { bank_id: bankId },
+            query: { detail: "metadata" },
+          });
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_list_pages failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_get_page",
+      {
+        async execute(params) {
+          const resp = await sdk.getMentalModel({
+            client: lowLevel,
+            path: {
+              bank_id: bankId,
+              mental_model_id: String(params.page_id ?? ""),
+            },
+            query: { detail: "content" },
+          });
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_get_page failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_create_page",
+      {
+        async execute(params) {
+          const resp = await sdk.createMentalModel({
+            client: lowLevel,
+            path: { bank_id: bankId },
+            body: {
+              id: String(params.page_id ?? ""),
+              name: String(params.name ?? ""),
+              source_query: String(params.source_query ?? ""),
+              max_tokens: 4096,
+              trigger: {
+                ...KNOWLEDGE_PAGE_TRIGGER_DEFAULTS,
+                fact_types: [...KNOWLEDGE_PAGE_TRIGGER_DEFAULTS.fact_types],
+              },
+            },
+          });
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_create_page failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_update_page",
+      {
+        async execute(params) {
+          const result = await invocationClient.updateMentalModel(
+            bankId,
+            String(params.page_id ?? ""),
+            {
+              name: typeof params.name === "string" ? params.name : undefined,
+              sourceQuery:
+                typeof params.source_query === "string"
+                  ? params.source_query
+                  : undefined,
+            },
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult(result);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_delete_page",
+      {
+        async execute(params) {
+          await invocationClient.deleteMentalModel(
+            bankId,
+            String(params.page_id ?? ""),
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult({ success: true });
+        },
+      },
+    ],
+    [
+      "agent_knowledge_recall",
+      {
+        async execute(params) {
+          const maxTokens = parseKnowledgeRecallMaxTokens(params.max_tokens);
+          const types = normalizeKnowledgeFactTypes(
+            params.fact_types ?? params.types,
+            DEFAULT_KNOWLEDGE_RECALL_FACT_TYPES,
+          );
+          const result = await invocationClient.recall(
+            bankId,
+            String(params.query ?? ""),
+            {
+              maxTokens,
+              types,
+            },
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult(result);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_reflect",
+      {
+        async execute(params) {
+          const factTypes = normalizeKnowledgeFactTypes(
+            params.fact_types,
+            DEFAULT_KNOWLEDGE_REFLECT_FACT_TYPES,
+          );
+          const parsedMaxTokens = Math.floor(Number(params.max_tokens ?? 1024));
+          const maxTokens = Number.isFinite(parsedMaxTokens)
+            ? Math.max(1, parsedMaxTokens)
+            : 1024;
+          const budget =
+            params.budget === "mid" ||
+            params.budget === "high" ||
+            params.budget === "low"
+              ? params.budget
+              : "low";
+          const resp = await retryOnCapacity(
+            () =>
+              sdk.reflect({
+                client: lowLevel,
+                path: { bank_id: bankId },
+                body: {
+                  query: String(params.query ?? ""),
+                  budget,
+                  max_tokens: maxTokens,
+                  fact_types: [...factTypes],
+                  include:
+                    params.include_facts === true ? { facts: {} } : undefined,
+                  exclude_mental_models:
+                    typeof params.exclude_mental_models === "boolean"
+                      ? params.exclude_mental_models
+                      : undefined,
+                },
+              }),
+            DEFAULT_MAX_ATTEMPTS,
+          );
+          guard.rethrowAuthorityError();
+          if (resp.error) {
+            throw new Error(
+              `agent_knowledge_reflect failed: ${JSON.stringify(resp.error)}`,
+            );
+          }
+          return formatKnowledgeToolResult(resp.data);
+        },
+      },
+    ],
+    [
+      "agent_knowledge_ingest",
+      {
+        async execute(params) {
+          const docId = String(params.title ?? "")
+            .toLowerCase()
+            .replace(/ /g, "-");
+          const result = await invocationClient.retainBatch(
+            bankId,
+            [{ content: String(params.content ?? ""), document_id: docId }],
+            { async: true },
+          );
+          guard.rethrowAuthorityError();
+          return formatKnowledgeToolResult(result);
+        },
+      },
+    ],
+  ]);
+
+  return { invocationClient, rawToolsByName };
+}
 
 /**
  * Structured payload for a knowledge tool result.
@@ -380,13 +685,14 @@ async function ensureBankDefaultsApplied(
   config: PluginConfig,
   options?: {
     assertAuthorityCurrent?: () => void;
-    fallbackClient?: HindsightClient;
+    rethrowAuthorityError?: () => void;
+    clientOverride?: HindsightClient;
   },
 ): Promise<void> {
   if (!hasConfiguredBankDefaults(config)) {
     return;
   }
-  const activeClient = client ?? options?.fallbackClient;
+  const activeClient = options?.clientOverride ?? client;
   if (!activeClient) {
     return;
   }
@@ -401,7 +707,7 @@ async function ensureBankDefaultsApplied(
         try {
           options.assertAuthorityCurrent!();
         } catch (err) {
-          authorityFailure = err;
+          authorityFailure ??= err;
           throw err;
         }
       }
@@ -413,9 +719,11 @@ async function ensureBankDefaultsApplied(
       config,
       guardedAssertAuthority,
     );
+    options?.rethrowAuthorityError?.();
     banksWithDefaultsApplied.add(bankId);
     debug(`[Hindsight] Applied configured defaults for bank: ${bankId}`);
   } catch (error) {
+    options?.rethrowAuthorityError?.();
     if (authorityFailure !== undefined) {
       throw authorityFailure;
     }
@@ -4498,16 +4806,6 @@ ${memoriesFormatted}
           apiToken,
           bankId: getDefaultBankId(pluginConfig),
         });
-        type RawKnowledgeTool = (typeof catalogTools)[number];
-        type RawKnowledgeToolResult = Awaited<
-          ReturnType<RawKnowledgeTool["execute"]>
-        >;
-        let fallbackBankDefaultsClient: HindsightClient | undefined;
-        const getBankDefaultsClient = () =>
-          (fallbackBankDefaultsClient ??= new HindsightClient({
-            baseUrl: apiUrl,
-            apiKey: apiToken,
-          }));
         const assertLiveToolAuthority = (
           ctx: OpenClawPluginToolContext<2>,
         ): void => {
@@ -4523,34 +4821,20 @@ ${memoriesFormatted}
         // V2 tool factory: `create(ctx)` can run during metadata-only catalog
         // inspection when no admitted invocation is active, so live authority
         // checks and bank resolution run inside `execute()` across initialization,
-        // SDK dispatch, and data return. (#13)
+        // synchronous HTTP transport dispatch (including retries), and result
+        // release. (#13)
         const factory: OpenClawPluginToolFactory<2> = {
           contextVersion: 2,
           create(ctx: OpenClawPluginToolContext<2>) {
-            const rawToolsByBank = new Map<
-              string,
-              Map<string, RawKnowledgeTool>
-            >();
-            const getRawToolsForBank = (bankId: string) => {
-              let byName = rawToolsByBank.get(bankId);
-              if (!byName) {
-                const rawTools = createKnowledgeTools({
-                  apiUrl,
-                  apiToken,
-                  bankId,
-                });
-                byName = new Map(rawTools.map((t) => [t.name, t]));
-                rawToolsByBank.set(bankId, byName);
-              }
-              return byName;
-            };
-
             const executeAuthorized = async (
               runOperation: (
-                rawToolsByName: Map<string, RawKnowledgeTool>,
-              ) => Promise<RawKnowledgeToolResult>,
+                rawToolsByName: Map<string, InvocationKnowledgeDelegate>,
+              ) => Promise<InvocationKnowledgeToolResult>,
             ) => {
-              assertLiveToolAuthority(ctx);
+              const guard = createAuthorityGuardHandle(() =>
+                assertLiveToolAuthority(ctx),
+              );
+              guard.assertAuthority();
               const config = currentPluginConfig || pluginConfig;
               const resolution = resolveBankIdForKnowledgeTools(ctx, config);
               if (resolution.identityError) {
@@ -4561,22 +4845,41 @@ ${memoriesFormatted}
                   details: { error: resolution.identityError },
                 };
               }
+              const ext = detectExternalApi(config);
+              const activeApiUrl =
+                ext.apiUrl ||
+                hindsightServer?.getBaseUrl() ||
+                `http://localhost:${config.apiPort || 9077}`;
+              const activeApiToken =
+                ext.apiToken || config.hindsightApiToken || undefined;
+              const { invocationClient, rawToolsByName } =
+                createInvocationKnowledgeTools({
+                  apiUrl: activeApiUrl,
+                  apiToken: activeApiToken,
+                  bankId: resolution.bankId,
+                  userAgent: USER_AGENT,
+                  guard,
+                });
+
               await ensureBankDefaultsApplied(resolution.bankId, config, {
-                assertAuthorityCurrent: () => assertLiveToolAuthority(ctx),
-                fallbackClient: getBankDefaultsClient(),
+                assertAuthorityCurrent: guard.assertAuthority,
+                rethrowAuthorityError: guard.rethrowAuthorityError,
+                clientOverride: invocationClient,
               });
-              assertLiveToolAuthority(ctx);
-              const rawToolsByName = getRawToolsForBank(resolution.bankId);
-              let result: RawKnowledgeToolResult;
+              guard.rethrowAuthorityError();
+              guard.assertAuthority();
+              let result: InvocationKnowledgeToolResult;
               try {
                 result = await runOperation(rawToolsByName);
               } catch (err) {
                 // Surface explicit invocation/audience revocation ahead of
                 // downstream transport or abort errors when revoked in flight.
-                assertLiveToolAuthority(ctx);
+                guard.rethrowAuthorityError();
+                guard.assertAuthority();
                 throw err;
               }
-              assertLiveToolAuthority(ctx);
+              guard.rethrowAuthorityError();
+              guard.assertAuthority();
               return { ...result, details: knowledgeToolDetails(result) };
             };
 

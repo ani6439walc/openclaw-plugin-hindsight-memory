@@ -221,4 +221,75 @@ describe("applyConfiguredBankDefaults", () => {
       }),
     ).rejects.toThrow(/updateBankConfig failed/);
   });
+
+  it("blocks HTTP dispatch when authority is revoked during createBank async request preparation", async () => {
+    const client = new HindsightClient(clientOpts);
+    let revoked = false;
+    const origCreateBank = HindsightClient.prototype.createBank;
+    const createBankSpy = vi
+      .spyOn(HindsightClient.prototype, "createBank")
+      .mockImplementation(function (
+        this: InstanceType<typeof HindsightClient>,
+        ...args
+      ) {
+        queueMicrotask(() => {
+          revoked = true;
+        });
+        return origCreateBank.apply(this, args);
+      });
+
+    await expect(
+      applyConfiguredBankDefaults(
+        client,
+        "bank-prep-create",
+        {
+          bankMission: "Mission A",
+          enableAutoConsolidation: true,
+        },
+        () => {
+          if (revoked) {
+            throw new Error("authority revoked during createBank prep");
+          }
+        },
+      ),
+    ).rejects.toThrow("authority revoked during createBank prep");
+
+    expect(createBankSpy).toHaveBeenCalledTimes(1);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("blocks PATCH HTTP dispatch when authority is revoked during updateBankConfig async request preparation", async () => {
+    const client = new HindsightClient(clientOpts);
+    let revoked = false;
+    const origUpdateBankConfig = HindsightClient.prototype.updateBankConfig;
+    const updateBankSpy = vi
+      .spyOn(HindsightClient.prototype, "updateBankConfig")
+      .mockImplementation(function (
+        this: InstanceType<typeof HindsightClient>,
+        ...args
+      ) {
+        queueMicrotask(() => {
+          revoked = true;
+        });
+        return origUpdateBankConfig.apply(this, args);
+      });
+
+    await expect(
+      applyConfiguredBankDefaults(
+        client,
+        "bank-prep-patch",
+        {
+          enableAutoConsolidation: false,
+        },
+        () => {
+          if (revoked) {
+            throw new Error("authority revoked during updateBankConfig prep");
+          }
+        },
+      ),
+    ).rejects.toThrow("authority revoked during updateBankConfig prep");
+
+    expect(updateBankSpy).toHaveBeenCalledTimes(1);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
 });

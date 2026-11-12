@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   OpenClawPluginApi,
@@ -43,18 +46,37 @@ describe("knowledge tools V2 authority & prepared memoryAudience (#13)", () => {
   let HindsightClient: typeof import("@vectorize-io/hindsight-client").HindsightClient;
   let registeredDescriptor: RegisteredDescriptor | undefined;
   let registeredMeta: { names?: string[]; optional?: boolean } | undefined;
+  let registeredService:
+    | {
+        start?: (ctx: unknown) => Promise<void>;
+        stop?: (ctx: unknown) => Promise<void>;
+      }
+    | undefined;
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
     vi.resetModules();
     registeredDescriptor = undefined;
     registeredMeta = undefined;
+    registeredService = undefined;
     pluginModule = await import("./index.js");
     HindsightClient = (await import("@vectorize-io/hindsight-client"))
       .HindsightClient;
 
     fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = extractFetchUrl(input);
+      if (url.endsWith("/version")) {
+        return new Response(
+          JSON.stringify({
+            api_version: "0.10.2",
+            features: { store_document_text: true },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
       return new Response(
         JSON.stringify({
           ok: true,
@@ -73,7 +95,11 @@ describe("knowledge tools V2 authority & prepared memoryAudience (#13)", () => {
     vi.stubGlobal("fetch", fetchMock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await registeredService?.stop?.({
+      config: {},
+      logger: { info() {}, warn() {}, error() {} },
+    });
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -91,7 +117,12 @@ describe("knowledge tools V2 authority & prepared memoryAudience (#13)", () => {
         logLevel: "off",
         ...pluginConfig,
       },
-      registerService() {},
+      registerService(svc: unknown) {
+        registeredService = svc as {
+          start?: (ctx: unknown) => Promise<void>;
+          stop?: (ctx: unknown) => Promise<void>;
+        };
+      },
       registerTool(factory: OpenClawPluginToolFactory, meta?: unknown) {
         registeredDescriptor = factory as unknown as RegisteredDescriptor;
         registeredMeta = meta as { names?: string[]; optional?: boolean };
@@ -579,5 +610,449 @@ describe("knowledge tools V2 authority & prepared memoryAudience (#13)", () => {
     expect(lastFetchUrl()).toContain(
       "/v1/default/banks/auth_test-org-static/memories/recall",
     );
+  });
+
+  it.each(["invocation", "audience"] as const)(
+    "blocks HTTP dispatch with zero fetch calls when %s authority is revoked during asynchronous SDK request preparation",
+    async (revokedGuard) => {
+      const descriptor = registerPluginWithConfig();
+      const sessionKey = `agent:main:discord:channel:prep-${revokedGuard}`;
+      const expectedMessage =
+        revokedGuard === "invocation"
+          ? "invocation revoked during async request prep"
+          : "memory audience revoked during async request prep";
+
+      // 1. memory_store (`retainBatch` -> `POST /memories`)
+      let storeRevoked = false;
+      const origRetainBatch = HindsightClient.prototype.retainBatch;
+      const retainBatchSpy = vi
+        .spyOn(HindsightClient.prototype, "retainBatch")
+        .mockImplementation(function (
+          this: InstanceType<typeof HindsightClient>,
+          ...args
+        ) {
+          queueMicrotask(() => {
+            storeRevoked = true;
+          });
+          return origRetainBatch.apply(this, args);
+        });
+
+      const storeTools = descriptor.create({
+        agentId: "main",
+        sessionKey,
+        requesterSenderId: "user-prep",
+        messageChannel: "discord",
+        nativeChannelId: `prep-${revokedGuard}`,
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "main",
+          sessionKey,
+          sessionId: `sess-prep-${revokedGuard}`,
+        },
+        assertInvocationCurrent() {
+          if (storeRevoked && revokedGuard === "invocation") {
+            throw new Error(expectedMessage);
+          }
+        },
+        assertMemoryAudienceCurrent() {
+          if (storeRevoked && revokedGuard === "audience") {
+            throw new Error(expectedMessage);
+          }
+        },
+      });
+
+      await expect(
+        storeTools
+          .find((t) => t.name === "memory_store")!
+          .execute("prep-1", {
+            title: "Uncommitted Write",
+            content: "Must never leave the process",
+          }),
+      ).rejects.toThrow(expectedMessage);
+      expect(retainBatchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+      retainBatchSpy.mockRestore();
+
+      // 2. knowledge_page create (`sdk.createMentalModel` -> `POST /mental-models`)
+      let createPageChecks = 0;
+      let createPageRevoked = false;
+      const createPageTools = descriptor.create({
+        agentId: "main",
+        sessionKey,
+        requesterSenderId: "user-prep",
+        messageChannel: "discord",
+        nativeChannelId: `prep-${revokedGuard}`,
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "main",
+          sessionKey,
+          sessionId: `sess-prep-${revokedGuard}`,
+        },
+        assertInvocationCurrent() {
+          if (revokedGuard === "invocation") {
+            createPageChecks += 1;
+            if (createPageRevoked) {
+              throw new Error(expectedMessage);
+            }
+            if (createPageChecks === 2) {
+              // Check #2 is the pre-SDK check immediately before `sdk.createMentalModel`.
+              // Schedule revocation so it fires during `await beforeRequest(options)`.
+              queueMicrotask(() => {
+                createPageRevoked = true;
+              });
+            }
+          }
+        },
+        assertMemoryAudienceCurrent() {
+          if (revokedGuard === "audience") {
+            createPageChecks += 1;
+            if (createPageRevoked) {
+              throw new Error(expectedMessage);
+            }
+            if (createPageChecks === 2) {
+              queueMicrotask(() => {
+                createPageRevoked = true;
+              });
+            }
+          }
+        },
+      });
+
+      await expect(
+        createPageTools
+          .find((t) => t.name === "knowledge_page")!
+          .execute("prep-2", {
+            action: "create",
+            page_id: "aborted-page",
+            name: "Aborted Page",
+            source_query: "Should never be created",
+          }),
+      ).rejects.toThrow(expectedMessage);
+      expect(createPageChecks).toBe(3);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // 3. knowledge_page delete (`deleteMentalModel` -> `DELETE /mental-models/...`)
+      let deleteRevoked = false;
+      const origDeleteMentalModel = HindsightClient.prototype.deleteMentalModel;
+      const deleteSpy = vi
+        .spyOn(HindsightClient.prototype, "deleteMentalModel")
+        .mockImplementation(function (
+          this: InstanceType<typeof HindsightClient>,
+          ...args
+        ) {
+          queueMicrotask(() => {
+            deleteRevoked = true;
+          });
+          return origDeleteMentalModel.apply(this, args);
+        });
+
+      const deletePageTools = descriptor.create({
+        agentId: "main",
+        sessionKey,
+        requesterSenderId: "user-prep",
+        messageChannel: "discord",
+        nativeChannelId: `prep-${revokedGuard}`,
+        memoryAudience: {
+          kind: "conversation",
+          agentId: "main",
+          sessionKey,
+          sessionId: `sess-prep-${revokedGuard}`,
+        },
+        assertInvocationCurrent() {
+          if (deleteRevoked && revokedGuard === "invocation") {
+            throw new Error(expectedMessage);
+          }
+        },
+        assertMemoryAudienceCurrent() {
+          if (deleteRevoked && revokedGuard === "audience") {
+            throw new Error(expectedMessage);
+          }
+        },
+      });
+
+      await expect(
+        deletePageTools
+          .find((t) => t.name === "knowledge_page")!
+          .execute("prep-3", {
+            action: "delete",
+            page_id: "protected-page",
+          }),
+      ).rejects.toThrow(expectedMessage);
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["invocation", "audience"] as const)(
+    "blocks bank-defaults HTTP dispatches during async request preparation even when service.start() shared client is active (%s)",
+    async (revokedGuard) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "hindsight-tool-auth-svc-"));
+      try {
+        const descriptor = registerPluginWithConfig({
+          bankMission: "Mission Guard",
+          enableAutoConsolidation: true,
+          retainQueuePath: join(tempDir, "queue.jsonl"),
+        });
+
+        await registeredService?.start?.({
+          config: {},
+          stateDir: tempDir,
+          logger: { info() {}, warn() {}, error() {} },
+        });
+        fetchMock.mockClear();
+
+        const sessionKey = `agent:main:discord:channel:svc-${revokedGuard}`;
+        const expectedMessage =
+          revokedGuard === "invocation"
+            ? "invocation revoked during active-service bank defaults prep"
+            : "audience revoked during active-service bank defaults prep";
+
+        // Phase A: Revoke during `createBank` async request preparation -> zero HTTP calls
+        let createRevoked = false;
+        const origCreateBank = HindsightClient.prototype.createBank;
+        const createBankSpy = vi
+          .spyOn(HindsightClient.prototype, "createBank")
+          .mockImplementation(function (
+            this: InstanceType<typeof HindsightClient>,
+            ...args
+          ) {
+            queueMicrotask(() => {
+              createRevoked = true;
+            });
+            return origCreateBank.apply(this, args);
+          });
+
+        const toolsA = descriptor.create({
+          agentId: "main",
+          sessionKey,
+          requesterSenderId: `svc-user-${revokedGuard}`,
+          messageChannel: "discord",
+          nativeChannelId: `svc-${revokedGuard}`,
+          memoryAudience: {
+            kind: "conversation",
+            agentId: "main",
+            sessionKey,
+            sessionId: `sess-svc-${revokedGuard}`,
+          },
+          assertInvocationCurrent() {
+            if (createRevoked && revokedGuard === "invocation") {
+              throw new Error(expectedMessage);
+            }
+          },
+          assertMemoryAudienceCurrent() {
+            if (createRevoked && revokedGuard === "audience") {
+              throw new Error(expectedMessage);
+            }
+          },
+        });
+
+        await expect(
+          toolsA
+            .find((t) => t.name === "memory_recall")!
+            .execute("svc-a", { query: "status" }),
+        ).rejects.toThrow(expectedMessage);
+        expect(createBankSpy).toHaveBeenCalledTimes(1);
+        expect(fetchMock).not.toHaveBeenCalled();
+        createBankSpy.mockRestore();
+
+        // Phase B: Let `createBank` PUT succeed, then revoke during `updateBankConfig`
+        // async request preparation -> exactly 1 fetch (the authorized PUT), zero PATCH/recall!
+        let patchRevoked = false;
+        const origUpdateBankConfig = HindsightClient.prototype.updateBankConfig;
+        const updateBankSpy = vi
+          .spyOn(HindsightClient.prototype, "updateBankConfig")
+          .mockImplementation(function (
+            this: InstanceType<typeof HindsightClient>,
+            ...args
+          ) {
+            queueMicrotask(() => {
+              patchRevoked = true;
+            });
+            return origUpdateBankConfig.apply(this, args);
+          });
+
+        const toolsB = descriptor.create({
+          agentId: "main",
+          sessionKey,
+          requesterSenderId: `svc-user-${revokedGuard}`,
+          messageChannel: "discord",
+          nativeChannelId: `svc-${revokedGuard}`,
+          memoryAudience: {
+            kind: "conversation",
+            agentId: "main",
+            sessionKey,
+            sessionId: `sess-svc-${revokedGuard}`,
+          },
+          assertInvocationCurrent() {
+            if (patchRevoked && revokedGuard === "invocation") {
+              throw new Error(expectedMessage);
+            }
+          },
+          assertMemoryAudienceCurrent() {
+            if (patchRevoked && revokedGuard === "audience") {
+              throw new Error(expectedMessage);
+            }
+          },
+        });
+
+        await expect(
+          toolsB
+            .find((t) => t.name === "memory_recall")!
+            .execute("svc-b", { query: "status" }),
+        ).rejects.toThrow(expectedMessage);
+        expect(updateBankSpy).toHaveBeenCalledTimes(1);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        const onlyDispatchedRequest = fetchMock.mock.calls[0]?.[0] as Request;
+        expect(onlyDispatchedRequest.method).toBe("PUT");
+        expect(extractFetchUrl(onlyDispatchedRequest)).toContain(
+          `/v1/default/banks/auth_test-svc-user-${revokedGuard}`,
+        );
+      } finally {
+        await registeredService?.stop?.({
+          config: {},
+          logger: { info() {}, warn() {}, error() {} },
+        });
+        registeredService = undefined;
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["invocation", "audience"] as const)(
+    "re-checks %s authority synchronously before capacity retry dispatches for memory_recall and memory_reflect",
+    async (revokedGuard) => {
+      const descriptor = registerPluginWithConfig();
+      const sessionKey = `agent:main:discord:channel:retry-${revokedGuard}`;
+      const expectedMessage =
+        revokedGuard === "invocation"
+          ? "invocation revoked before capacity retry"
+          : "audience revoked before capacity retry";
+
+      for (const toolName of ["memory_recall", "memory_reflect"] as const) {
+        fetchMock.mockReset();
+        let revokedAfterFirstAttempt = false;
+        fetchMock.mockImplementation(async () => {
+          // Schedule revocation after Attempt 1's response is returned to
+          // `retryOnCapacity`, so Attempt 1 remains valid while Attempt 2 hits
+          // the transport guard synchronously before dispatching fetch.
+          setTimeout(() => {
+            revokedAfterFirstAttempt = true;
+          }, 0);
+          return new Response(JSON.stringify({ detail: "at capacity" }), {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "0.02",
+            },
+          });
+        });
+
+        const tools = descriptor.create({
+          agentId: "main",
+          sessionKey,
+          requesterSenderId: `retry-user-${revokedGuard}`,
+          messageChannel: "discord",
+          nativeChannelId: `retry-${revokedGuard}`,
+          memoryAudience: {
+            kind: "conversation",
+            agentId: "main",
+            sessionKey,
+            sessionId: `sess-retry-${revokedGuard}`,
+          },
+          assertInvocationCurrent() {
+            if (revokedAfterFirstAttempt && revokedGuard === "invocation") {
+              throw new Error(expectedMessage);
+            }
+          },
+          assertMemoryAudienceCurrent() {
+            if (revokedAfterFirstAttempt && revokedGuard === "audience") {
+              throw new Error(expectedMessage);
+            }
+          },
+        });
+
+        await expect(
+          tools
+            .find((t) => t.name === toolName)!
+            .execute(`retry-${toolName}`, { query: "capacity check" }),
+        ).rejects.toThrow(expectedMessage);
+
+        // Attempt 1 dispatched prior to revocation; zero retry dispatches occurred after revocation.
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
+
+  it("preserves post-operation authority guards when authority is revoked while streaming the response body", async () => {
+    const descriptor = registerPluginWithConfig();
+    const sessionKey = "agent:main:discord:channel:body-stream";
+    let audienceRevokedDuringBodyRead = false;
+
+    // Revoke inside `pull()` so revocation occurs strictly during `response.text()`
+    // after `guardedFetch` has returned the 200 OK `Response` headers.
+    fetchMock.mockImplementationOnce(async () => {
+      const encoder = new TextEncoder();
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            audienceRevokedDuringBodyRead = true;
+            controller.enqueue(
+              encoder.encode(
+                JSON.stringify({
+                  results: [
+                    {
+                      id: "stream-1",
+                      text: "SECRET_STREAMED_PAYLOAD",
+                      type: "world",
+                    },
+                  ],
+                }),
+              ),
+            );
+            controller.close();
+          }
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const tools = descriptor.create({
+      agentId: "main",
+      sessionKey,
+      requesterSenderId: "stream-user",
+      messageChannel: "discord",
+      nativeChannelId: "body-stream",
+      memoryAudience: {
+        kind: "conversation",
+        agentId: "main",
+        sessionKey,
+        sessionId: "sess-stream",
+      },
+      assertInvocationCurrent() {},
+      assertMemoryAudienceCurrent() {
+        if (audienceRevokedDuringBodyRead) {
+          throw new Error("audience revoked while reading response body");
+        }
+      },
+    });
+
+    let caughtErr: unknown;
+    try {
+      await tools
+        .find((t) => t.name === "memory_recall")!
+        .execute("stream-call", { query: "streamed" });
+    } catch (err) {
+      caughtErr = err;
+    }
+    expect(caughtErr).toBeInstanceOf(Error);
+    expect((caughtErr as Error).message).toBe(
+      "audience revoked while reading response body",
+    );
+    expect(String(caughtErr)).not.toContain("SECRET_STREAMED_PAYLOAD");
   });
 });
