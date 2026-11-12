@@ -10,7 +10,20 @@ import {
 import { deriveBankId, prepareRetentionTranscript } from "./index.js";
 import type { PluginConfig, PluginHookAgentContext } from "./types.js";
 import { parseSessionFile } from "./session-file.js";
-import type { ParsedSessionFile, SessionMessage } from "./session-file.js";
+import {
+  parseSessionRecords,
+  readSessionFileIdentity,
+} from "./session-file.js";
+import type {
+  ParsedSessionFile,
+  ParsedSessionTranscript,
+  SessionMessage,
+} from "./session-file.js";
+import { createBackfillSourceReader } from "./backfill-source.js";
+import type {
+  BackfillSourceReader,
+  SqliteBackfillSource,
+} from "./backfill-source.js";
 
 // Re-exported: these used to live here and callers import them from this module.
 export { parseSessionFile };
@@ -19,14 +32,19 @@ export type { ParsedSessionFile, SessionMessage };
 export interface BackfillCliOptions {
   openclawRoot: string;
   includeArchive: boolean;
+  includeRetainedSqlite?: boolean;
   selectedAgents?: Set<string>;
   limit?: number;
   bankStrategy: "mirror-config" | "agent" | "fixed";
   fixedBank?: string;
 }
 
+export type BackfillTranscriptSource =
+  { kind: "jsonl"; filePath: string } | SqliteBackfillSource;
+
 export interface BackfillPlanEntry {
-  filePath: string;
+  filePath?: string;
+  source: BackfillTranscriptSource;
   agentId: string;
   sessionId: string;
   startedAt?: string;
@@ -39,7 +57,8 @@ export interface BackfillPlanEntry {
 export interface BackfillCheckpointEntry {
   status: "enqueued" | "completed" | "failed";
   bankId: string;
-  filePath: string;
+  filePath?: string;
+  source?: BackfillTranscriptSource;
   sessionId: string;
   updatedAt: string;
   error?: string;
@@ -72,6 +91,10 @@ const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
   retainRoles: ["user", "assistant"],
 };
 
+export function withBackfillConfigDefaults(config: PluginConfig): PluginConfig {
+  return { ...DEFAULT_PLUGIN_CONFIG, ...config };
+}
+
 export function defaultOpenClawRoot(): string {
   return resolve(join(homedir(), ".openclaw"));
 }
@@ -87,10 +110,9 @@ export function loadPluginConfigFromOpenClawRoot(
   const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
     plugins?: { entries?: Record<string, { config?: PluginConfig }> };
   };
-  return {
-    ...DEFAULT_PLUGIN_CONFIG,
-    ...(raw.plugins?.entries?.["hindsight-memory"]?.config || {}),
-  };
+  return withBackfillConfigDefaults(
+    raw.plugins?.entries?.["hindsight-memory"]?.config || {},
+  );
 }
 
 function sessionDirectories(
@@ -148,7 +170,7 @@ export function discoverSessionFiles(
 }
 
 function backfillContextForSession(
-  session: ParsedSessionFile,
+  session: Pick<ParsedSessionTranscript, "agentId" | "sessionKey">,
 ): PluginHookAgentContext {
   return {
     agentId: session.agentId,
@@ -157,7 +179,7 @@ function backfillContextForSession(
 }
 
 function deriveTargetBank(
-  session: ParsedSessionFile,
+  session: ParsedSessionTranscript,
   pluginConfig: PluginConfig,
   bankStrategy: BackfillCliOptions["bankStrategy"],
   fixedBank?: string,
@@ -175,38 +197,219 @@ function deriveTargetBank(
 }
 
 export function stableDocumentId(
-  session: ParsedSessionFile,
+  session: Pick<ParsedSessionTranscript, "agentId" | "sessionId">,
   bankId: string,
 ): string {
   return `backfill::${bankId}::${session.agentId}::${session.sessionId}`;
 }
 
-export function buildBackfillPlan(
-  pluginConfig: PluginConfig,
-  opts: BackfillCliOptions,
-): {
+export interface BackfillSourceIssue {
+  agentId: string;
+  sessionId?: string;
+  reason: string;
+}
+
+export class BackfillPlanError extends Error {
+  constructor(readonly issues: BackfillSourceIssue[]) {
+    super(
+      `Backfill plan is incomplete: ${issues.map((issue) => `${issue.agentId}${issue.sessionId ? `/${issue.sessionId}` : ""}: ${issue.reason}`).join("; ")}`,
+    );
+    this.name = "BackfillPlanError";
+  }
+}
+
+export interface BackfillPlan {
   entries: BackfillPlanEntry[];
   discoveredSessions: number;
   skippedEmpty: number;
-} {
+  duplicateSources: number;
+  missingStores: number;
+}
+
+export async function buildBackfillPlan(
+  pluginConfig: PluginConfig,
+  opts: BackfillCliOptions,
+  sourceReader?: BackfillSourceReader,
+): Promise<BackfillPlan> {
+  const reader = sourceReader ?? createBackfillSourceReader(opts.openclawRoot);
+  try {
+    return await buildPlanWithReader(pluginConfig, opts, reader);
+  } finally {
+    if (!sourceReader) await reader.close();
+  }
+}
+
+async function buildPlanWithReader(
+  pluginConfig: PluginConfig,
+  opts: BackfillCliOptions,
+  reader: BackfillSourceReader,
+): Promise<BackfillPlan> {
   const entries: BackfillPlanEntry[] = [];
+  const issues: BackfillSourceIssue[] = [];
   let discoveredSessions = 0;
   let skippedEmpty = 0;
-
-  for (const candidate of discoverSessionFiles(
+  let duplicateSources = 0;
+  let missingStores = 0;
+  const prepared = await reader.prepare();
+  const files = discoverSessionFiles(
     opts.openclawRoot,
     opts.includeArchive,
-  )) {
-    if (opts.selectedAgents && !opts.selectedAgents.has(candidate.agentId)) {
+  ).filter(
+    (candidate) =>
+      !opts.selectedAgents || opts.selectedAgents.has(candidate.agentId),
+  );
+  const agentsRoot = join(opts.openclawRoot, "agents");
+  const directoryAgents = existsSync(agentsRoot)
+    ? readdirSync(agentsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+    : [];
+  const agentIds = [
+    ...(opts.selectedAgents ??
+      new Set([
+        ...prepared.agentIds,
+        ...directoryAgents,
+        ...files.map((file) => file.agentId),
+      ])),
+  ].sort();
+  type Candidate =
+    | SqliteBackfillSource
+    | { kind: "jsonl"; agentId: string; sessionId: string; filePath: string };
+  const candidates: Candidate[] = [];
+  for (const file of files) {
+    try {
+      candidates.push({
+        kind: "jsonl",
+        ...file,
+        ...(await readSessionFileIdentity(file.filePath, file.agentId)),
+      });
+    } catch (error) {
+      issues.push({
+        agentId: file.agentId,
+        reason:
+          error instanceof SyntaxError ? "invalid-jsonl" : "source-read-failed",
+      });
+    }
+  }
+
+  for (const agentId of agentIds) {
+    const result = await reader.discover(
+      agentId,
+      opts.includeRetainedSqlite === true,
+    );
+    if (result.status === "unavailable") {
+      if (result.reason === "missing-store") missingStores += 1;
+      else issues.push({ agentId, reason: result.reason });
       continue;
     }
+    for (const source of result.sources) {
+      if (source.agentId !== agentId) {
+        issues.push({ agentId, reason: "host source agent mismatch" });
+      } else if (
+        source.artifactKind === "active-session" ||
+        opts.includeRetainedSqlite === true
+      ) {
+        candidates.push(source);
+      }
+    }
+  }
+  if (issues.length) throw new BackfillPlanError(issues);
+
+  // SQLite is the canonical copy. Stable ordering also prevents filesystem
+  // enumeration order from changing which unique sessions consume --limit.
+  candidates.sort(
+    (a, b) =>
+      a.agentId.localeCompare(b.agentId) ||
+      a.sessionId.localeCompare(b.sessionId) ||
+      (a.kind === b.kind ? 0 : a.kind === "sqlite" ? -1 : 1) ||
+      (a.kind === "jsonl" && b.kind === "jsonl"
+        ? a.filePath.localeCompare(b.filePath)
+        : 0),
+  );
+  const seen = new Map<
+    string,
+    { transcript: string | null; sessionKey?: string }
+  >();
+
+  for (const candidate of candidates) {
+    const candidateKey = JSON.stringify([
+      candidate.agentId,
+      candidate.sessionId,
+    ]);
+    // Verify every copy of the final selected identity before applying --limit.
+    if (opts.limit && entries.length >= opts.limit && !seen.has(candidateKey))
+      break;
     discoveredSessions += 1;
-    const parsed = parseSessionFile(candidate.filePath, candidate.agentId);
-    const retention = prepareRetentionTranscript(
-      parsed.messages,
-      pluginConfig,
-      true,
-    );
+    let parsed: ParsedSessionTranscript;
+    try {
+      if (candidate.kind === "jsonl") {
+        parsed = parseSessionFile(candidate.filePath, candidate.agentId);
+      } else {
+        const result = await reader.read(candidate);
+        if (result.status === "unavailable") {
+          issues.push({
+            agentId: candidate.agentId,
+            sessionId: candidate.sessionId,
+            reason: result.reason,
+          });
+          continue;
+        }
+        parsed = parseSessionRecords(result.events, candidate);
+      }
+      if (parsed.sessionId !== candidate.sessionId) {
+        issues.push({
+          agentId: candidate.agentId,
+          sessionId: candidate.sessionId,
+          reason: "source identity changed during planning",
+        });
+        continue;
+      }
+    } catch (error) {
+      // Parser errors can quote transcript bytes; keep source diagnostics free
+      // of conversation content at the CLI boundary.
+      issues.push({
+        agentId: candidate.agentId,
+        reason:
+          error instanceof SyntaxError ? "invalid-jsonl" : "source-read-failed",
+      });
+      continue;
+    }
+    let retention: ReturnType<typeof prepareRetentionTranscript>;
+    try {
+      retention = prepareRetentionTranscript(
+        parsed.messages,
+        pluginConfig,
+        true,
+      );
+    } catch {
+      issues.push({
+        agentId: parsed.agentId,
+        sessionId: parsed.sessionId,
+        reason: "invalid-message-content",
+      });
+      continue;
+    }
+    const key = JSON.stringify([parsed.agentId, parsed.sessionId]);
+    const previous = seen.get(key);
+    if (previous) {
+      if (
+        previous.transcript !== (retention?.transcript ?? null) ||
+        (previous.sessionKey &&
+          parsed.sessionKey &&
+          previous.sessionKey !== parsed.sessionKey)
+      ) {
+        issues.push({
+          agentId: parsed.agentId,
+          sessionId: parsed.sessionId,
+          reason: "conflicting transcript sources",
+        });
+      } else duplicateSources += 1;
+      continue;
+    }
+    seen.set(key, {
+      transcript: retention?.transcript ?? null,
+      sessionKey: parsed.sessionKey,
+    });
     if (!retention) {
       skippedEmpty += 1;
       continue;
@@ -217,8 +420,13 @@ export function buildBackfillPlan(
       opts.bankStrategy,
       opts.fixedBank,
     );
+    const source: BackfillTranscriptSource =
+      candidate.kind === "sqlite"
+        ? candidate
+        : { kind: "jsonl", filePath: candidate.filePath };
     entries.push({
-      filePath: parsed.filePath,
+      ...(candidate.kind === "jsonl" ? { filePath: candidate.filePath } : {}),
+      source,
       agentId: parsed.agentId,
       sessionId: parsed.sessionId,
       startedAt: parsed.startedAt,
@@ -227,12 +435,15 @@ export function buildBackfillPlan(
       transcript: retention.transcript,
       messageCount: retention.messageCount,
     });
-    if (opts.limit && entries.length >= opts.limit) {
-      break;
-    }
   }
-
-  return { entries, discoveredSessions, skippedEmpty };
+  if (issues.length) throw new BackfillPlanError(issues);
+  return {
+    entries,
+    discoveredSessions,
+    skippedEmpty,
+    duplicateSources,
+    missingStores,
+  };
 }
 
 export function loadCheckpoint(checkpointPath: string): BackfillCheckpoint {

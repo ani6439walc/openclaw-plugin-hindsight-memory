@@ -29,18 +29,24 @@ import {
   defaultCheckpointPath,
   defaultOpenClawRoot,
   loadCheckpoint,
-  loadPluginConfigFromOpenClawRoot,
+  withBackfillConfigDefaults,
+  BackfillPlanError,
   saveCheckpoint,
   type BackfillCheckpoint,
   type BackfillPlanEntry,
   type BackfillCliOptions,
 } from "./backfill-lib.js";
+import {
+  createBackfillSourceReader,
+  type BackfillSourceReader,
+} from "./backfill-source.js";
 
 interface ParsedArgs {
   openclawRoot: string;
   profile: string;
   agents: string[];
   includeArchive: boolean;
+  includeRetainedSqlite: boolean;
   limit?: number;
   dryRun: boolean;
   json: boolean;
@@ -77,6 +83,7 @@ function usage(): string {
     "  --agent <id>                  Restrict import to a specific agent (repeatable)",
     "  --include-archive             Include migration archives (default)",
     "  --exclude-archive             Exclude migration archives",
+    "  --include-retained-sqlite     Include retained/reset SQLite transcripts (off by default)",
     "  --limit <n>                   Stop after enqueueing N sessions",
     "  --dry-run                     Build and print the import plan without enqueueing",
     "  --json                        Print final summary as JSON",
@@ -98,6 +105,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     profile: "openclaw",
     agents: [],
     includeArchive: true,
+    includeRetainedSqlite: false,
     dryRun: false,
     json: false,
     resume: false,
@@ -131,6 +139,9 @@ function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--exclude-archive":
         args.includeArchive = false;
+        break;
+      case "--include-retained-sqlite":
+        args.includeRetainedSqlite = true;
         break;
       case "--limit":
         args.limit = Number(next());
@@ -464,26 +475,48 @@ async function waitForBanksToDrain(
 
 export async function runCli(
   argv: string[] = process.argv.slice(2),
+  dependencies: {
+    createSourceReader?: (root: string) => BackfillSourceReader;
+  } = {},
 ): Promise<void> {
   const args = parseArgs(argv);
   if (!existsSync(join(args.openclawRoot, "openclaw.json"))) {
     throw new Error(`could not find openclaw.json under ${args.openclawRoot}`);
   }
 
-  const pluginConfig = loadPluginConfigFromOpenClawRoot(args.openclawRoot);
+  const sourceReader = (
+    dependencies.createSourceReader ?? createBackfillSourceReader
+  )(args.openclawRoot);
+  try {
+    await runBackfill(args, sourceReader);
+  } finally {
+    await sourceReader.close();
+  }
+}
+
+async function runBackfill(
+  args: ParsedArgs,
+  sourceReader: BackfillSourceReader,
+): Promise<void> {
+  const prepared = await sourceReader.prepare();
+  const pluginConfig = withBackfillConfigDefaults(prepared.pluginConfig);
   const backfillOptions: BackfillCliOptions = {
     openclawRoot: args.openclawRoot,
     includeArchive: args.includeArchive,
+    includeRetainedSqlite: args.includeRetainedSqlite,
     selectedAgents: args.agents.length ? new Set(args.agents) : undefined,
     limit: args.limit,
     bankStrategy: args.bankStrategy,
     fixedBank: args.fixedBank,
   };
   const checkpoint = loadCheckpoint(args.checkpointPath);
-  const { entries, discoveredSessions, skippedEmpty } = buildBackfillPlan(
-    pluginConfig,
-    backfillOptions,
-  );
+  const {
+    entries,
+    discoveredSessions,
+    skippedEmpty,
+    duplicateSources,
+    missingStores,
+  } = await buildBackfillPlan(pluginConfig, backfillOptions, sourceReader);
   const plannedEntries = filterEntriesForResume(
     entries,
     checkpoint,
@@ -507,6 +540,9 @@ export async function runCli(
       discovered_sessions: discoveredSessions,
       planned_sessions: plannedEntries.length,
       skipped_empty: skippedEmpty,
+      duplicate_sources: duplicateSources,
+      missing_stores: missingStores,
+      include_retained_sqlite: args.includeRetainedSqlite,
       bank_strategy: args.bankStrategy,
       checkpoint_path: args.checkpointPath,
     };
@@ -596,11 +632,17 @@ export async function runCli(
       try {
         const metadata: Record<string, string> = {
           source: "openclaw-backfill",
-          file_path: entry.filePath,
           agent_id: entry.agentId,
           session_id: entry.sessionId,
           retained_at: new Date().toISOString(),
         };
+        if (entry.filePath) metadata.file_path = entry.filePath;
+        if (entry.source.kind === "sqlite") {
+          metadata.transcript_source = "sqlite";
+          metadata.store_path = entry.source.storePath;
+          if (entry.source.sessionKey)
+            metadata.session_key = entry.source.sessionKey;
+        }
         if (entry.startedAt) {
           metadata.session_started_at = entry.startedAt;
         }
@@ -614,6 +656,7 @@ export async function runCli(
           status: "enqueued",
           bankId: entry.bankId,
           filePath: entry.filePath,
+          source: entry.source,
           sessionId: entry.sessionId,
           updatedAt: new Date().toISOString(),
         };
@@ -634,6 +677,7 @@ export async function runCli(
           status: "failed",
           bankId: entry.bankId,
           filePath: entry.filePath,
+          source: entry.source,
           sessionId: entry.sessionId,
           updatedAt: new Date().toISOString(),
           error: error instanceof Error ? error.message : String(error),
@@ -689,6 +733,9 @@ export async function runCli(
     finalized_sessions: finalized,
     failed_sessions: failed,
     skipped_empty: skippedEmpty,
+    duplicate_sources: duplicateSources,
+    missing_stores: missingStores,
+    include_retained_sqlite: args.includeRetainedSqlite,
     bank_strategy: args.bankStrategy,
     checkpoint_path: args.checkpointPath,
   };
@@ -721,7 +768,16 @@ export function isDirectExecution(
 
 if (isDirectExecution()) {
   runCli().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
+    if (error instanceof BackfillPlanError && process.argv.includes("--json")) {
+      console.error(
+        JSON.stringify({
+          plan_complete: false,
+          error: error.message,
+          source_issues: error.issues,
+        }),
+      );
+    } else
+      console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
   });
 }

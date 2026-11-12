@@ -3,10 +3,24 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
-  buildBackfillPlan,
+  buildBackfillPlan as createBackfillPlan,
   loadPluginConfigFromOpenClawRoot,
   stableDocumentId,
 } from "./backfill-lib.js";
+import type { BackfillCliOptions } from "./backfill-lib.js";
+import type { PluginConfig } from "./types.js";
+
+// These fixtures exercise legacy files; SQLite contracts have their own suite.
+function buildBackfillPlan(config: PluginConfig, options: BackfillCliOptions) {
+  return createBackfillPlan(config, options, {
+    prepare: async () => ({ pluginConfig: config, agentIds: [] }),
+    discover: async () => ({ status: "unavailable", reason: "missing-store" }),
+    read: async () => {
+      throw new Error("Unexpected SQLite read in JSONL fixture");
+    },
+    close: async () => {},
+  });
+}
 
 const tempDirs: string[] = [];
 
@@ -46,7 +60,7 @@ afterEach(() => {
 describe("backfill planning", () => {
   it.each([true, false])(
     "preserves each message's Conversation info sender in backfill content (fenced=%s)",
-    (fenced) => {
+    async (fenced) => {
       const root = makeTempRoot();
       const message = (sender: Record<string, string>, text: string) => ({
         type: "message",
@@ -71,7 +85,7 @@ describe("backfill planning", () => {
         },
       ]);
 
-      const result = buildBackfillPlan(
+      const result = await buildBackfillPlan(
         { dynamicBankId: false, bankId: "test" },
         {
           openclawRoot: root,
@@ -89,7 +103,7 @@ describe("backfill planning", () => {
     },
   );
 
-  it("mirrors plugin bank routing from config by default", () => {
+  it("mirrors plugin bank routing from config by default", async () => {
     const root = makeTempRoot();
     writeOpenClawConfig(root, {
       plugins: {
@@ -114,7 +128,7 @@ describe("backfill planning", () => {
     ]);
 
     const config = loadPluginConfigFromOpenClawRoot(root);
-    const result = buildBackfillPlan(config, {
+    const result = await buildBackfillPlan(config, {
       openclawRoot: root,
       includeArchive: true,
       bankStrategy: "mirror-config",
@@ -137,7 +151,7 @@ describe("backfill planning", () => {
     );
   });
 
-  it("supports migration overrides for agent-only banks", () => {
+  it("supports migration overrides for agent-only banks", async () => {
     const root = makeTempRoot();
     writeOpenClawConfig(root, {
       plugins: { entries: { "hindsight-memory": { config: {} } } },
@@ -153,7 +167,7 @@ describe("backfill planning", () => {
     ]);
 
     const config = loadPluginConfigFromOpenClawRoot(root);
-    const result = buildBackfillPlan(config, {
+    const result = await buildBackfillPlan(config, {
       openclawRoot: root,
       includeArchive: true,
       bankStrategy: "agent",
@@ -163,7 +177,7 @@ describe("backfill planning", () => {
     expect(result.entries[0].bankId).toBe("proj-debug");
   });
 
-  it("can exclude archive sessions", () => {
+  it("can exclude archive sessions", async () => {
     const root = makeTempRoot();
     writeOpenClawConfig(root, {
       plugins: { entries: { "hindsight-memory": { config: {} } } },
@@ -186,7 +200,7 @@ describe("backfill planning", () => {
     );
 
     const config = loadPluginConfigFromOpenClawRoot(root);
-    const result = buildBackfillPlan(config, {
+    const result = await buildBackfillPlan(config, {
       openclawRoot: root,
       includeArchive: false,
       bankStrategy: "mirror-config",

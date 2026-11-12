@@ -35,6 +35,7 @@ afterEach(() => {
 function makeEntry(bankId: string, sessionId: string): BackfillPlanEntry {
   return {
     filePath: `/tmp/${sessionId}.jsonl`,
+    source: { kind: "jsonl", filePath: `/tmp/${sessionId}.jsonl` },
     agentId: bankId,
     sessionId,
     bankId,
