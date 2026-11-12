@@ -1,11 +1,31 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBackfillWorkerService } from "./backfill-source-worker.js";
+import type { BackfillSourceReader } from "./backfill-source.js";
+
+vi.mock("./backfill-projection.js", () => {
+  class BackfillProjectionError extends Error {
+    constructor(public reason: string) {
+      super("Invalid transcript");
+    }
+  }
+  return {
+    BackfillProjectionError,
+    projectBackfillTranscript(events: unknown[], expected: string) {
+      const header = events[0] as { type?: string; id?: string } | undefined;
+      if (header?.type !== "session" || header.id !== expected)
+        throw new BackfillProjectionError("missing-transcript");
+      return events;
+    },
+  };
+});
 
 const environment = {
   OPENCLAW_STATE_DIR: "/synthetic/selected",
   OPENCLAW_CONFIG_PATH: "/synthetic/selected/openclaw.json",
 };
-
 const source = {
   kind: "sqlite" as const,
   agentId: "main",
@@ -14,10 +34,20 @@ const source = {
   storePath: "/synthetic/logical/sessions.json",
   artifactKind: "active-session" as const,
 };
-
-function fixture() {
+const roots: string[] = [];
+afterEach(async () => {
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+async function fixture(snapshotMode = false) {
+  const root = await mkdtemp(join(tmpdir(), "hindsight-worker-test-"));
+  roots.push(root);
+  const snapshotPath = join(root, "snapshot.sqlite");
   const config = {
-    agents: { entries: { main: {}, other: {} } },
+    agents: { ownership: "explicit", entries: { main: {}, other: {} } },
+    session: { store: snapshotMode ? snapshotPath : source.storePath },
+    privateSentinel: "never-copy",
     plugins: {
       entries: { "hindsight-memory": { config: { bankId: "selected" } } },
     },
@@ -28,219 +58,396 @@ function fixture() {
     config,
   }));
   const listAgentIds = vi.fn(() => ["main", "other"]);
-  const discover = vi.fn(async (): Promise<unknown> => ({
-    status: "available",
-    entries: [],
-  }));
-  const read = vi.fn(async (): Promise<unknown> => ({
-    status: "available",
-    events: [],
-  }));
-  const host: Record<string, unknown> = {
-    listSessionTranscriptCorpusEntriesReadOnlyForAgent: discover,
-    readSessionTranscriptSnapshotReadOnly: read,
-  };
+  const normalizeAgentIdStrict = vi.fn((value: string) =>
+    value === "../main"
+      ? { ok: true, value: "main" }
+      : value === "!!!"
+        ? { ok: false, error: "unrepresentable" }
+        : { ok: true, value },
+  );
+  const resolveStorePath = vi.fn(() => source.storePath);
+  const resolveSessionStoreBackupPaths = vi.fn(() => [
+    source.storePath,
+    "/synthetic/physical/custom.db",
+    "/synthetic/physical/custom.db-wal",
+    "/synthetic/physical/custom.db-shm",
+  ]);
+  const corpus = vi.fn(async (): Promise<unknown> => []);
+  const raw = vi.fn(async (): Promise<unknown> => [
+    { type: "session", id: source.sessionId },
+  ]);
   const loadModule = vi.fn(async (specifier: string): Promise<unknown> => {
-    if (specifier === "openclaw/plugin-sdk/health")
-      return { readConfigFileSnapshot };
-    if (specifier === "openclaw/plugin-sdk/agent-scope-runtime")
-      return { listAgentIds };
-    if (specifier === "openclaw/plugin-sdk/session-transcript-readonly")
-      return host;
-    throw new Error(`unexpected import ${specifier}`);
+    switch (specifier) {
+      case "openclaw/plugin-sdk/health":
+        return { readConfigFileSnapshot };
+      case "openclaw/plugin-sdk/agent-scope-runtime":
+        return { listAgentIds };
+      case "openclaw/plugin-sdk/routing":
+        return { normalizeAgentIdStrict };
+      case "openclaw/plugin-sdk/session-store-runtime":
+        return {
+          resolveStorePath,
+          resolveSessionStoreBackupPaths,
+          loadTranscriptEvents: raw,
+        };
+      case "openclaw/plugin-sdk/memory-core-host-engine-sessions":
+        return { listSessionTranscriptCorpusEntriesForAgent: corpus };
+      case "openclaw/plugin-sdk/agent-sessions":
+        return {
+          SessionManager: class {
+            static fromEntries() {
+              return {};
+            }
+          },
+          buildSessionContext: () => ({}),
+        };
+      default:
+        throw Error("Unsupported module");
+    }
   });
+  const inner: BackfillSourceReader = {
+    prepare: vi.fn(async () => ({
+      pluginConfig: {},
+      agentIds: ["main", "other"],
+    })),
+    discover: vi.fn(async () => ({
+      status: "available",
+      sources: [{ ...source, storePath: snapshotPath }],
+    })),
+    read: vi.fn(async () => ({
+      status: "available",
+      events: [{ type: "message" }],
+    })),
+    close: vi.fn(async () => {}),
+  };
+  const get = vi.fn(
+    async (): Promise<
+      | { status: "available"; root: string; storePath: string }
+      | { status: "unavailable"; reason: string }
+    > => ({ status: "available", root, storePath: snapshotPath }),
+  );
+  const close = vi.fn(async () => {});
+  const reader = vi.fn(() => inner);
+  const selectedEnvironment = snapshotMode
+    ? {
+        OPENCLAW_STATE_DIR: root,
+        OPENCLAW_CONFIG_PATH: join(root, "openclaw.json"),
+      }
+    : environment;
+  if (snapshotMode)
+    await writeFile(
+      selectedEnvironment.OPENCLAW_CONFIG_PATH,
+      JSON.stringify(config),
+    );
   return {
-    service: createBackfillWorkerService(loadModule, environment),
+    selectedEnvironment,
+    normalizeAgentIdStrict,
+    service: createBackfillWorkerService(
+      loadModule,
+      selectedEnvironment,
+      { snapshots: { get, close }, reader },
+      snapshotMode,
+    ),
     config,
-    host,
+    root,
+    snapshotPath,
     loadModule,
     readConfigFileSnapshot,
     listAgentIds,
-    discover,
-    read,
+    resolveStorePath,
+    resolveSessionStoreBackupPaths,
+    corpus,
+    raw,
+    inner,
+    get,
+    close,
+    reader,
   };
 }
 
-describe("isolated backfill host service", () => {
-  it("prepares only the selected plugin config and public agent roster once", async () => {
-    const f = fixture();
+describe("stock backfill original-root worker", () => {
+  it("prepares selected config once without importing nonexistent or source host readers", async () => {
+    const f = await fixture();
     const before = { ...process.env };
-
     expect(await f.service.prepare()).toEqual({
       pluginConfig: { bankId: "selected" },
       agentIds: ["main", "other"],
     });
     await f.service.prepare();
-
     expect(f.readConfigFileSnapshot).toHaveBeenCalledExactlyOnceWith({
       observe: false,
       isolateEnv: true,
       pluginValidation: "core-only",
       recoverSuspicious: false,
     });
-    expect(f.listAgentIds).toHaveBeenCalledExactlyOnceWith(f.config);
-    expect(
-      f.loadModule.mock.calls.map(([specifier]) => specifier).sort(),
-    ).toEqual([
+    expect(f.loadModule.mock.calls.map(([name]) => name).sort()).toEqual([
       "openclaw/plugin-sdk/agent-scope-runtime",
       "openclaw/plugin-sdk/health",
-      "openclaw/plugin-sdk/session-transcript-readonly",
     ]);
     expect(process.env).toEqual(before);
+    await f.service.close();
   });
-
-  it("rejects an old host instead of falling back to its writable corpus API", async () => {
-    const f = fixture();
-    delete f.host.listSessionTranscriptCorpusEntriesReadOnlyForAgent;
-    const oldApi = vi.fn();
-    f.host.listSessionTranscriptCorpusEntriesForAgent = oldApi;
-
-    await expect(f.service.prepare()).rejects.toThrow(
-      /unsupported OpenClaw host.*listSessionTranscriptCorpusEntriesReadOnlyForAgent/i,
-    );
-    expect(oldApi).not.toHaveBeenCalled();
-    expect(f.readConfigFileSnapshot).not.toHaveBeenCalled();
-  });
-
-  it("reports a missing read-only public module without reading config", async () => {
-    const f = fixture();
-    f.loadModule.mockRejectedValue(
-      new Error("synthetic module resolution failure"),
-    );
-
-    await expect(f.service.prepare()).rejects.toThrow(
-      /unsupported OpenClaw host.*session-transcript-readonly/i,
-    );
-    expect(f.readConfigFileSnapshot).not.toHaveBeenCalled();
-  });
-
-  it("rejects invalid config without returning config contents", async () => {
-    const f = fixture();
-    f.readConfigFileSnapshot.mockResolvedValue({
-      exists: true,
-      valid: false,
-      config: { ...f.config, privateSentinel: "never-disclose" },
-    });
-
-    await expect(f.service.prepare()).rejects.toThrow(
-      "Selected OpenClaw config is missing or invalid",
-    );
-    expect(f.discover).not.toHaveBeenCalled();
-  });
-
-  it("classifies SQLite rows and preserves their logical store identity", async () => {
-    const f = fixture();
-    const retained = {
-      ...source,
-      sessionId: "retained-1",
-      artifactKind: "retained-session",
-      updatedAtMs: 1234,
-    };
-    f.discover.mockResolvedValue({
-      status: "available",
-      entries: [
-        { ...source, transcriptSource: "sqlite" },
-        { ...retained, transcriptSource: "sqlite" },
-        {
-          artifactKind: "archive-artifact",
-          sessionFile: "/synthetic/archive.jsonl",
-        },
-        {
-          agentId: "main",
-          artifactKind: "active-session",
-          sessionId: "legacy",
-        },
-      ],
-    });
-
+  it("copies only the resolved physical database and maps corpus metadata back to original logical identity", async () => {
+    const f = await fixture();
     expect(await f.service.discover("main", true)).toEqual({
-      status: "available",
-      sources: [source, retained],
-    });
-    expect(f.discover).toHaveBeenCalledWith("main", {
-      config: f.config,
-      includeRetainedSqlite: true,
-      includeContentRevision: false,
-    });
-    expect(await f.service.discover("main", false)).toEqual({
       status: "available",
       sources: [source],
     });
-  });
-
-  it.each([
-    { agentId: "other" },
-    { sessionId: "" },
-    { storePath: undefined },
-    { artifactKind: "unrecognized" },
-  ])("rejects malformed SQLite identity %j", async (replacement) => {
-    const f = fixture();
-    f.discover.mockResolvedValue({
-      status: "available",
-      entries: [{ ...source, ...replacement, transcriptSource: "sqlite" }],
+    expect(f.get).toHaveBeenCalledWith("/synthetic/physical/custom.db");
+    expect(f.resolveStorePath).toHaveBeenCalledWith(source.storePath, {
+      agentId: "main",
+      env: environment,
     });
-
-    await expect(f.service.discover("main", true)).rejects.toThrow(
-      /invalid.*corpus/i,
+    expect(f.resolveSessionStoreBackupPaths).toHaveBeenCalledWith({
+      agentId: "main",
+      storePath: source.storePath,
+    });
+    const scratchConfig = JSON.parse(
+      await readFile(join(f.root, "openclaw.json"), "utf8"),
     );
-  });
-
-  it.each(["missing-store", "schema-unavailable", "refused", "unavailable"])(
-    "preserves corpus refusal %s",
-    async (reason) => {
-      const f = fixture();
-      f.discover.mockResolvedValue({
-        status: "unavailable",
-        reason,
-        detail: "synthetic detail",
-      });
-
-      expect(await f.service.discover("main", true)).toEqual({
-        status: "unavailable",
-        reason,
-        detail: "synthetic detail",
-      });
-    },
-  );
-
-  it("reads the host snapshot unchanged with selected-root environment", async () => {
-    const f = fixture();
-    const events = [
-      {
-        type: "message",
-        timestamp: "2026-11-12T00:00:00Z",
-        message: { role: "toolResult", content: [], toolCallId: "fixture" },
-      },
-    ];
-    f.read.mockResolvedValue({ status: "available", events });
-
+    expect(scratchConfig).toEqual({
+      agents: { ownership: "explicit", entries: { main: {}, other: {} } },
+      session: { store: f.snapshotPath },
+    });
+    expect(f.corpus).not.toHaveBeenCalled();
+    expect(f.raw).not.toHaveBeenCalled();
     expect(await f.service.read(source)).toEqual({
       status: "available",
-      events,
+      events: [{ type: "message" }],
     });
-    expect(f.read).toHaveBeenCalledWith({
+    expect(f.inner.read).toHaveBeenCalledWith({
+      ...source,
+      storePath: f.snapshotPath,
+    });
+    expect(f.inner.discover).toHaveBeenCalledOnce();
+    await f.service.close();
+    expect(f.inner.close).toHaveBeenCalledOnce();
+    expect(f.close).toHaveBeenCalledOnce();
+  });
+  it("shares one physical snapshot reader for multiple agents without copying private configuration", async () => {
+    const f = await fixture();
+    vi.mocked(f.inner.discover).mockImplementation(async (agentId) => ({
+      status: "available",
+      sources: [{ ...source, agentId, storePath: f.snapshotPath }],
+    }));
+    await f.service.discover("main", true);
+    await f.service.discover("other", true);
+    expect(f.reader).toHaveBeenCalledOnce();
+    expect(f.inner.prepare).toHaveBeenCalledOnce();
+    expect(await readFile(join(f.root, "openclaw.json"), "utf8")).not.toContain(
+      "never-copy",
+    );
+    await f.service.close();
+  });
+  it("returns missing-store without original host reads so legacy scanning can continue", async () => {
+    const f = await fixture();
+    f.get.mockResolvedValue({ status: "unavailable", reason: "missing-store" });
+    expect(await f.service.discover("main", true)).toEqual({
+      status: "unavailable",
+      reason: "missing-store",
+    });
+    expect(f.reader).not.toHaveBeenCalled();
+    expect(f.corpus).not.toHaveBeenCalled();
+    expect(f.raw).not.toHaveBeenCalled();
+    await f.service.close();
+  });
+  it("fails closed on invalid config and ambiguous resolver families without copying or reading", async () => {
+    const f = await fixture();
+    f.resolveSessionStoreBackupPaths.mockReturnValue([source.storePath]);
+    await expect(f.service.discover("main", true)).rejects.toThrow(
+      /resolve.*SQLite/i,
+    );
+    expect(f.get).not.toHaveBeenCalled();
+    await f.service.close();
+    const invalid = await fixture();
+    invalid.readConfigFileSnapshot.mockResolvedValue({
+      exists: true,
+      valid: false,
+      config: invalid.config,
+    });
+    await expect(invalid.service.prepare()).rejects.toThrow(
+      "Selected OpenClaw config is missing or invalid",
+    );
+    await invalid.service.close();
+  });
+  it("resolves a requested retired agent absent from configured roster and adds only its scratch identity", async () => {
+    const f = await fixture();
+    vi.mocked(f.inner.discover).mockResolvedValue({
+      status: "available",
+      sources: [
+        { ...source, agentId: "retired-worker", storePath: f.snapshotPath },
+      ],
+    });
+    expect(await f.service.discover("retired-worker", true)).toEqual({
+      status: "available",
+      sources: [{ ...source, agentId: "retired-worker" }],
+    });
+    expect(f.resolveStorePath).toHaveBeenCalledWith(source.storePath, {
+      agentId: "retired-worker",
+      env: environment,
+    });
+    const config = JSON.parse(
+      await readFile(join(f.root, "openclaw.json"), "utf8"),
+    );
+    expect(config.agents.entries).toEqual({
+      main: {},
+      other: {},
+      "retired-worker": {},
+    });
+    expect(config).not.toHaveProperty("privateSentinel");
+    await f.service.close();
+  });
+
+  it("preserves sanitized child preparation errors with their isolation stage", async () => {
+    const f = await fixture();
+    vi.mocked(f.inner.prepare).mockRejectedValue(
+      Error("Selected OpenClaw config is missing or invalid"),
+    );
+    await expect(f.service.discover("main", true)).rejects.toThrow(
+      "OpenClaw snapshot reader preparation failed: Selected OpenClaw config is missing or invalid",
+    );
+    await f.service.close();
+  });
+  it("adds discovery/read stages while withholding native or source data errors", async () => {
+    const f = await fixture();
+    vi.mocked(f.inner.discover).mockRejectedValue(
+      Error("Unsupported OpenClaw host: missing released corpus reader"),
+    );
+    await expect(f.service.discover("main", true)).rejects.toThrow(
+      "OpenClaw snapshot reader discovery failed: Unsupported OpenClaw host: missing released corpus reader",
+    );
+    vi.mocked(f.inner.read).mockRejectedValue(
+      Error("private transcript/source filesystem error"),
+    );
+    await expect(f.service.read(source)).rejects.toThrow(
+      /^OpenClaw snapshot reader transcript read failed$/,
+    );
+    await f.service.close();
+  });
+
+  it("rejects original source substitution and noncanonical agent identities", async () => {
+    const f = await fixture();
+    await expect(
+      f.service.read({ ...source, storePath: "/another/store" }),
+    ).rejects.toThrow(/identity changed/);
+    await expect(f.service.discover("../main", true)).rejects.toThrow(
+      /invalid.*agent/i,
+    );
+    await expect(f.service.discover("!!!", true)).rejects.toThrow(
+      /invalid.*agent/i,
+    );
+    expect(f.raw).not.toHaveBeenCalled();
+    await f.service.close();
+  });
+});
+
+describe("isolated stock snapshot reader", () => {
+  it("uses the released corpus signature with readOnly and no revision reads", async () => {
+    const f = await fixture(true);
+    const selected = { ...source, storePath: f.snapshotPath };
+    f.corpus.mockResolvedValue([
+      { ...selected, transcriptSource: "sqlite" },
+      { artifactKind: "archive-artifact" },
+      {
+        ...selected,
+        sessionId: "retained",
+        artifactKind: "retained-session",
+        transcriptSource: "sqlite",
+      },
+    ]);
+    expect(await f.service.discover("main", false)).toEqual({
+      status: "available",
+      sources: [selected],
+    });
+    expect(f.corpus).toHaveBeenCalledWith("main", {
+      config: f.config,
+      readOnly: true,
+      includeRetainedSqlite: false,
+      includeContentRevision: false,
+    });
+    expect(f.get).not.toHaveBeenCalled();
+    await f.service.close();
+  });
+  it("extends an existing shared snapshot roster for a later retired agent and validates the scratch config", async () => {
+    const f = await fixture(true);
+    await f.service.prepare();
+    f.readConfigFileSnapshot.mockImplementation(async () => ({
+      exists: true,
+      valid: true,
+      config: JSON.parse(await readFile(join(f.root, "openclaw.json"), "utf8")),
+    }));
+    expect(await f.service.discover("retired-worker", true)).toEqual({
+      status: "available",
+      sources: [],
+    });
+    const scratch = JSON.parse(
+      await readFile(join(f.root, "openclaw.json"), "utf8"),
+    );
+    expect(scratch.agents.entries["retired-worker"]).toEqual({});
+    expect(scratch).not.toHaveProperty("privateSentinel");
+    expect(f.corpus).toHaveBeenCalledWith(
+      "retired-worker",
+      expect.objectContaining({ config: scratch }),
+    );
+    expect(f.get).not.toHaveBeenCalled();
+    await f.service.close();
+  });
+
+  it("reads raw events through public SDK and returns projected records", async () => {
+    const f = await fixture(true);
+    const event = {
+      type: "message",
+      timestamp: "2026-11-12",
+      message: { role: "user", content: "hello" },
+    };
+    f.raw.mockResolvedValue([{ type: "session", id: source.sessionId }, event]);
+    expect(
+      await f.service.read({ ...source, storePath: f.snapshotPath }),
+    ).toEqual({
+      status: "available",
+      events: [{ type: "session", id: source.sessionId }, event],
+    });
+    expect(f.raw).toHaveBeenCalledWith({
       agentId: source.agentId,
       sessionId: source.sessionId,
       sessionKey: source.sessionKey,
-      storePath: source.storePath,
-      env: environment,
+      storePath: f.snapshotPath,
+      env: f.selectedEnvironment,
     });
+    await f.service.close();
   });
-
   it.each([
-    "missing-store",
-    "missing-transcript",
-    "schema-unavailable",
-    "cold",
-    "refused",
-    "unavailable",
-  ])("preserves snapshot refusal %s", async (reason) => {
-    const f = fixture();
-    f.read.mockResolvedValue({ status: "unavailable", reason });
-
-    expect(await f.service.read(source)).toEqual({
-      status: "unavailable",
-      reason,
+    { events: [] },
+    { events: [{ type: "session", id: "wrong" }] },
+    { events: [{ type: "message" }] },
+  ])(
+    "classifies absent original transcript header as missing, not empty (%j)",
+    async ({ events }) => {
+      const f = await fixture(true);
+      f.raw.mockResolvedValue(events);
+      expect(
+        await f.service.read({ ...source, storePath: f.snapshotPath }),
+      ).toEqual({ status: "unavailable", reason: "missing-transcript" });
+      await f.service.close();
+    },
+  );
+  it("accepts a matching header-only transcript as valid empty", async () => {
+    const f = await fixture(true);
+    expect(
+      await f.service.read({ ...source, storePath: f.snapshotPath }),
+    ).toEqual({
+      status: "available",
+      events: [{ type: "session", id: source.sessionId }],
     });
+    await f.service.close();
+  });
+  it("fails closed on host read/cold restore errors without exposing contents or original fallback", async () => {
+    const f = await fixture(true);
+    f.raw.mockRejectedValue(Error("private transcript contents"));
+    expect(
+      await f.service.read({ ...source, storePath: f.snapshotPath }),
+    ).toEqual({ status: "unavailable", reason: "unavailable" });
+    expect(f.get).not.toHaveBeenCalled();
+    await f.service.close();
   });
 });

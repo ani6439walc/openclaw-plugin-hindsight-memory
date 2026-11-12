@@ -1,5 +1,7 @@
 import { fork, type ChildProcess } from "node:child_process";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import type { PluginConfig } from "./types.js";
 
 export interface SqliteBackfillSource {
@@ -50,12 +52,50 @@ type PendingRequest = {
 const REQUEST_TIMEOUT_MS = 90_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 
+export function createBackfillSnapshotReader(
+  root: string,
+): BackfillSourceReader {
+  return createReader(root, true);
+}
+
+function privateScratchRoot(selectedRoot: string): string {
+  let sourceRoot = selectedRoot;
+  try {
+    sourceRoot = realpathSync(selectedRoot);
+  } catch {}
+  for (const candidate of new Set([tmpdir(), "/tmp", "/var/tmp"])) {
+    let base: string;
+    try {
+      base = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    const distance = relative(sourceRoot, base);
+    if (!distance || (!distance.startsWith("..") && !isAbsolute(distance)))
+      continue;
+    try {
+      return mkdtempSync(join(base, "hindsight-backfill-"));
+    } catch {}
+  }
+  throw new Error(
+    "Unable to create private backfill scratch outside selected state",
+  );
+}
+
 /** CLI-only transport: host modules never load in the caller's process. */
 export function createBackfillSourceReader(
   openclawRoot: string,
 ): BackfillSourceReader {
+  return createReader(openclawRoot, false);
+}
+
+function createReader(
+  openclawRoot: string,
+  snapshotMode: boolean,
+): BackfillSourceReader {
   const root = resolve(openclawRoot);
   let child: ChildProcess | undefined;
+  let scratchRoot: string | undefined;
   let nextId = 0;
   let closed = false;
   let failed: Error | undefined;
@@ -76,18 +116,73 @@ export function createBackfillSourceReader(
     pending.clear();
   }
 
+  function killWorker(signal: NodeJS.Signals = "SIGTERM"): void {
+    if (!child) return;
+    if (!snapshotMode && process.platform !== "win32" && child.pid) {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    } else child.kill(signal);
+  }
+
+  async function cleanup(): Promise<void> {
+    if (!scratchRoot) return;
+    // The detached group contains the outer reader, snapshot readers and host workers.
+    // Reap the whole group before removing databases they may still be accessing.
+    if (child?.pid && process.platform !== "win32") {
+      const deadline = Date.now() + CLOSE_TIMEOUT_MS;
+      while (true) {
+        try {
+          process.kill(-child.pid, 0);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+          throw new Error("Unable to verify OpenClaw backfill worker cleanup");
+        }
+        killWorker("SIGKILL");
+        if (Date.now() >= deadline)
+          throw new Error("OpenClaw backfill descendants did not exit");
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+    }
+    rmSync(scratchRoot, { recursive: true, force: true });
+    scratchRoot = undefined;
+  }
+
   function start(): ChildProcess {
     if (child) return child;
-    child = fork(new URL("./backfill-source-worker.js", import.meta.url), [], {
-      env: {
-        ...process.env,
-        OPENCLAW_STATE_DIR: root,
-        OPENCLAW_CONFIG_PATH: join(root, "openclaw.json"),
+    if (!snapshotMode) scratchRoot = privateScratchRoot(root);
+    const environment: NodeJS.ProcessEnv = snapshotMode
+      ? {
+          PATH: process.env.PATH,
+          LANG: process.env.LANG,
+          TZ: process.env.TZ,
+          HOME: root,
+          XDG_CONFIG_HOME: join(root, "config"),
+          XDG_CACHE_HOME: join(root, "cache"),
+          XDG_DATA_HOME: join(root, "data"),
+          TMPDIR: root,
+        }
+      : { ...process.env };
+    child = fork(
+      new URL("./backfill-source-worker.js", import.meta.url),
+      snapshotMode ? ["--snapshot-reader"] : [],
+      {
+        env: {
+          ...environment,
+          OPENCLAW_STATE_DIR: root,
+          OPENCLAW_CONFIG_PATH: join(root, "openclaw.json"),
+          ...(scratchRoot
+            ? { HINDSIGHT_BACKFILL_SCRATCH_ROOT: scratchRoot }
+            : {}),
+        },
+        detached: !snapshotMode && process.platform !== "win32",
+        execArgv: [],
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        serialization: "advanced",
       },
-      execArgv: [],
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-      serialization: "advanced",
-    });
+    );
     child.on("message", (message: unknown) => {
       if (!message || typeof message !== "object") return;
       const reply = message as Record<string, unknown>;
@@ -105,7 +200,7 @@ export function createBackfillSourceReader(
     });
     child.on("error", () => {
       fail(new Error("Unable to run OpenClaw backfill source worker"));
-      child?.kill();
+      killWorker();
     });
     child.on("exit", () => {
       exited = true;
@@ -128,7 +223,7 @@ export function createBackfillSourceReader(
     return new Promise<T>((resolveRequest, reject) => {
       const timer = setTimeout(() => {
         fail(new Error("OpenClaw backfill source worker request timed out"));
-        worker.kill();
+        killWorker();
       }, timeoutMs);
       pending.set(id, {
         resolve: (value) => resolveRequest(value as T),
@@ -138,7 +233,7 @@ export function createBackfillSourceReader(
       worker.send({ id, ...operation }, (error: Error | null) => {
         if (error) {
           fail(new Error("Unable to send OpenClaw backfill source request"));
-          worker.kill();
+          killWorker();
         }
       });
     });
@@ -159,7 +254,10 @@ export function createBackfillSourceReader(
       if (closePromise) return closePromise;
       closed = true;
       closePromise = (async () => {
-        if (!child || exited) return;
+        if (!child || exited) {
+          await cleanup();
+          return;
+        }
         if (!failed) {
           try {
             await request({ operation: "close" }, CLOSE_TIMEOUT_MS);
@@ -167,24 +265,50 @@ export function createBackfillSourceReader(
             // Close must still reap an unhealthy worker.
           }
         }
-        if (exited) return;
-        child.kill();
+        if (exited) {
+          await cleanup();
+          return;
+        }
+        killWorker();
         let timer: ReturnType<typeof setTimeout> | undefined;
+        let shutdownError: unknown;
         try {
           await Promise.race([
             exitPromise,
             new Promise<never>((_, reject) => {
               timer = setTimeout(() => {
-                child?.kill("SIGKILL");
+                killWorker("SIGKILL");
                 reject(
                   new Error("OpenClaw backfill source worker did not exit"),
                 );
               }, CLOSE_TIMEOUT_MS);
             }),
           ]);
+        } catch (error) {
+          shutdownError = error;
+          // SIGKILL retirement is asynchronous. Keep ownership of private snapshots
+          // until the leader exits and cleanup verifies that the whole group is gone.
+          if (!exited) {
+            await Promise.race([
+              exitPromise,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        "OpenClaw backfill source worker did not exit after SIGKILL",
+                      ),
+                    ),
+                  CLOSE_TIMEOUT_MS,
+                );
+              }),
+            ]);
+          }
         } finally {
           clearTimeout(timer);
         }
+        await cleanup();
+        if (shutdownError) throw shutdownError;
       })();
       return closePromise;
     },
