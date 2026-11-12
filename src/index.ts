@@ -1,5 +1,6 @@
 import type {
   InputProvenance,
+  MemoryAudience,
   OpenClawPluginApi,
   OpenClawMessage,
   OpenClawMessageContentBlock,
@@ -8,6 +9,7 @@ import type {
   PluginHookEvent,
   PluginHookSessionContext,
   OpenClawPluginToolContext,
+  OpenClawPluginToolFactory,
   MemoryResult,
   RetainRequest,
 } from "./types.js";
@@ -376,18 +378,46 @@ export function scopeClient(
 async function ensureBankDefaultsApplied(
   bankId: string,
   config: PluginConfig,
+  options?: {
+    assertAuthorityCurrent?: () => void;
+    fallbackClient?: HindsightClient;
+  },
 ): Promise<void> {
-  if (!client || !clientOptions || !hasConfiguredBankDefaults(config)) {
+  if (!hasConfiguredBankDefaults(config)) {
+    return;
+  }
+  const activeClient = client ?? options?.fallbackClient;
+  if (!activeClient) {
     return;
   }
   if (banksWithDefaultsApplied.has(bankId)) {
     return;
   }
+  let authorityFailure: unknown;
+  const guardedAssertAuthority = options?.assertAuthorityCurrent
+    ? () => {
+        try {
+          options.assertAuthorityCurrent!();
+        } catch (err) {
+          authorityFailure = err;
+          throw err;
+        }
+      }
+    : undefined;
   try {
-    await applyConfiguredBankDefaults(client, bankId, config);
+    await applyConfiguredBankDefaults(
+      activeClient,
+      bankId,
+      config,
+      guardedAssertAuthority,
+    );
     banksWithDefaultsApplied.add(bankId);
     debug(`[Hindsight] Applied configured defaults for bank: ${bankId}`);
   } catch (error) {
+    if (authorityFailure !== undefined) {
+      throw authorityFailure;
+    }
+    options?.assertAuthorityCurrent?.();
     log.warn(
       `could not apply bank defaults for ${bankId}: ${error instanceof Error ? error.message : error}`,
     );
@@ -2469,45 +2499,182 @@ export interface KnowledgeToolBankResolution {
   identityError?: string;
 }
 
+function validateMemoryAudienceForToolContext(
+  audience: MemoryAudience | undefined,
+  ctxAgentId: string | undefined,
+  ctxSessionKey: string | undefined,
+): string | undefined {
+  if (audience === undefined) return undefined;
+  if (!audience || typeof audience !== "object") {
+    return "Hindsight knowledge tools skipped: malformed memoryAudience.";
+  }
+  const audienceAgentId = normalizeNonEmptyString(audience.agentId);
+  if (!audienceAgentId) {
+    return "Hindsight knowledge tools skipped: memoryAudience is missing agentId.";
+  }
+  if (ctxAgentId && ctxAgentId !== audienceAgentId) {
+    return "Hindsight knowledge tools skipped: memoryAudience agent does not match tool context agent.";
+  }
+  const parsedCtxAgentId = ctxSessionKey
+    ? parseSessionKey(ctxSessionKey).agentId
+    : undefined;
+  if (parsedCtxAgentId && parsedCtxAgentId !== audienceAgentId) {
+    return "Hindsight knowledge tools skipped: memoryAudience agent does not match session key agent.";
+  }
+  if (audience.kind === "owner-private") {
+    return undefined;
+  }
+  if (audience.kind === "conversation") {
+    if (!ctxSessionKey) {
+      return "Hindsight knowledge tools skipped: conversation memoryAudience requires an active session context.";
+    }
+    const audienceSessionKey = normalizeNonEmptyString(audience.sessionKey);
+    const audienceSessionId = normalizeNonEmptyString(audience.sessionId);
+    if (!audienceSessionKey || !audienceSessionId) {
+      return "Hindsight knowledge tools skipped: conversation memoryAudience is missing sessionKey or sessionId.";
+    }
+    const parsedAudienceAgentId = parseSessionKey(audienceSessionKey).agentId;
+    if (parsedAudienceAgentId && parsedAudienceAgentId !== audienceAgentId) {
+      return "Hindsight knowledge tools skipped: conversation memoryAudience sessionKey does not match its agentId.";
+    }
+    return undefined;
+  }
+  return "Hindsight knowledge tools skipped: unsupported memoryAudience kind.";
+}
+
 /**
- * Resolve the Hindsight bank for knowledge tools using the same identity path as
- * auto-recall/retain. When user-scoped dynamic banking is enabled, unresolved
- * identity must not silently route to the shared default or anonymous bank.
+ * Resolve the Hindsight bank for knowledge tools using host-prepared authority
+ * (`memoryAudience` for session turns, explicit host fields for non-session
+ * invocations, and explicit static/`agentBankMap` sharing policies).
  */
 export function resolveBankIdForKnowledgeTools(
   toolCtx: OpenClawPluginToolContext,
   pluginConfig: PluginConfig,
 ): KnowledgeToolBankResolution {
-  const hookCtx: PluginHookAgentContext = {
-    agentId: toolCtx.agentId,
-    sessionKey: toolCtx.sessionKey,
-    workspaceDir: toolCtx.workspaceDir,
-    senderId: toolCtx.requesterSenderId,
-    messageProvider: toolCtx.messageChannel ?? toolCtx.deliveryContext?.channel,
-    channelId: toolCtx.nativeChannelId ?? toolCtx.deliveryContext?.to,
-  };
+  const ctxAgentId = normalizeNonEmptyString(toolCtx.agentId);
+  const ctxSessionKey = normalizeNonEmptyString(toolCtx.sessionKey);
+  const audience = toolCtx.memoryAudience;
+  const fallbackBankId = deriveBankId({ agentId: ctxAgentId }, pluginConfig);
 
-  // An explicitly mapped agent needs no identity resolution: its bank does not
-  // depend on the sender, so the user-scoped guards below must not reject it. (#3890)
-  const mappedBankId = mappedBankIdForAgent(hookCtx, pluginConfig);
+  const audienceValidationError = validateMemoryAudienceForToolContext(
+    audience,
+    ctxAgentId,
+    ctxSessionKey,
+  );
+  if (audienceValidationError) {
+    return {
+      bankId: fallbackBankId,
+      resolvedCtx: undefined,
+      identityError: audienceValidationError,
+    };
+  }
+
+  // Deliberate `agentBankMap` sharing policy: an explicitly mapped agent's bank
+  // is named by the operator and does not depend on session/user partitioning. (#3890)
+  const candidateAgentId =
+    normalizeNonEmptyString(audience?.agentId) ??
+    ctxAgentId ??
+    (ctxSessionKey ? parseSessionKey(ctxSessionKey).agentId : undefined);
+  const mappedBankId = mappedBankIdForAgent(
+    candidateAgentId ? { agentId: candidateAgentId } : undefined,
+    pluginConfig,
+  );
   if (mappedBankId) {
     return { bankId: mappedBankId, resolvedCtx: undefined };
   }
 
+  // Deliberate static-bank sharing policy: all traffic targets the configured bank.
   if (usesStaticBank(pluginConfig)) {
     return { bankId: getStaticBankId(pluginConfig), resolvedCtx: undefined };
   }
 
-  const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
-    sessionKey: toolCtx.sessionKey,
-    ctx: hookCtx,
-    pluginConfig,
-  });
-  const { reason: identityReason } = getIdentitySkipReason(
-    resolvedCtx,
-    pluginConfig,
-  );
-  const effectiveSkip = skipReason ?? identityReason;
+  const granularity = pluginConfig.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+
+  let resolvedCtx: PluginHookAgentContext | undefined;
+  let effectiveSkip: IdentitySkipReason | undefined;
+
+  if (ctxSessionKey) {
+    // Session turns require a host-prepared `memoryAudience` for dynamic bank
+    // derivation; never infer memory authority from `sessionKey` patterns alone. (#13)
+    if (!audience) {
+      return {
+        bankId: fallbackBankId,
+        resolvedCtx: undefined,
+        identityError:
+          "Hindsight knowledge tools skipped: missing host-prepared memoryAudience for session dynamic bank routing. " +
+          "Configure static banking (dynamicBankId: false + bankId) or agentBankMap if shared bank access without a session memory audience is intended.",
+      };
+    }
+
+    const authorizedSessionKey =
+      audience.kind === "conversation"
+        ? normalizeNonEmptyString(audience.sessionKey)!
+        : ctxSessionKey;
+    const hookCtx: PluginHookAgentContext = {
+      agentId: normalizeNonEmptyString(audience.agentId),
+      sessionKey: authorizedSessionKey,
+      workspaceDir: toolCtx.workspaceDir,
+      senderId: normalizeNonEmptyString(toolCtx.requesterSenderId),
+      messageProvider:
+        normalizeNonEmptyString(toolCtx.messageChannel) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.channel),
+      channelId:
+        normalizeNonEmptyString(toolCtx.nativeChannelId) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.to),
+    };
+    const identityResolution = resolveAndCacheIdentity({
+      sessionKey: authorizedSessionKey,
+      ctx: hookCtx,
+      pluginConfig,
+    });
+    resolvedCtx = identityResolution.resolvedCtx;
+    const { reason: identityReason } = getIdentitySkipReason(
+      resolvedCtx,
+      pluginConfig,
+    );
+    effectiveSkip = identityResolution.skipReason ?? identityReason;
+  } else {
+    // Non-session tool invocations (e.g. standalone authenticated RPC/CLI runs
+    // guarded by V2 `assertInvocationCurrent`) have no session turn and therefore
+    // no `memoryAudience`; route strictly from explicit host-provided tool fields.
+    const hookCtx: PluginHookAgentContext = {
+      agentId: normalizeNonEmptyString(audience?.agentId) ?? ctxAgentId,
+      workspaceDir: toolCtx.workspaceDir,
+      senderId: normalizeNonEmptyString(toolCtx.requesterSenderId),
+      messageProvider:
+        normalizeNonEmptyString(toolCtx.messageChannel) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.channel),
+      channelId:
+        normalizeNonEmptyString(toolCtx.nativeChannelId) ??
+        normalizeNonEmptyString(toolCtx.deliveryContext?.to),
+    };
+    const identityResolution = getIdentitySkipReason(hookCtx, pluginConfig);
+    resolvedCtx = identityResolution.resolvedCtx;
+    effectiveSkip = identityResolution.reason;
+
+    if (granularity.includes("agent") && !resolvedCtx?.agentId) {
+      return {
+        bankId: fallbackBankId,
+        resolvedCtx,
+        identityError:
+          "Hindsight knowledge tools skipped: missing agent identity for non-session dynamic bank routing.",
+      };
+    }
+    if (
+      !usesUserScopedBanking(pluginConfig) &&
+      effectiveSkip &&
+      (granularity.includes("provider") || granularity.includes("channel"))
+    ) {
+      return {
+        bankId: deriveBankId(resolvedCtx, pluginConfig),
+        resolvedCtx,
+        identityError: `Hindsight knowledge tools skipped: ${formatIdentitySkipReason(effectiveSkip)}.`,
+      };
+    }
+  }
+
   const bankId = deriveBankId(resolvedCtx, pluginConfig);
 
   if (usesUserScopedBanking(pluginConfig)) {
@@ -4324,67 +4491,126 @@ ${memoriesFormatted}
         })();
         const apiToken = pluginConfig.hindsightApiToken || undefined;
 
-        // Factory: called per session with agent context, returns tools scoped to that bank.
-        // Use host-supplied tool identity and the shared hook identity cache so
-        // explicit tools and automatic recall resolve the same per-user bank.
-        const factory = (ctx: OpenClawPluginToolContext) => {
-          const resolution = resolveBankIdForKnowledgeTools(ctx, pluginConfig);
-          const rawTools = createKnowledgeTools({
-            apiUrl,
-            apiToken,
-            bankId: resolution.bankId,
-          });
-          const rawToolsByName = new Map(rawTools.map((t) => [t.name, t]));
+        const catalogTools = createKnowledgeTools({
+          apiUrl,
+          apiToken,
+          bankId: getDefaultBankId(pluginConfig),
+        });
+        type RawKnowledgeTool = (typeof catalogTools)[number];
+        type RawKnowledgeToolResult = Awaited<
+          ReturnType<RawKnowledgeTool["execute"]>
+        >;
+        let fallbackBankDefaultsClient: HindsightClient | undefined;
+        const getBankDefaultsClient = () =>
+          (fallbackBankDefaultsClient ??= new HindsightClient({
+            baseUrl: apiUrl,
+            apiKey: apiToken,
+          }));
+        const assertLiveToolAuthority = (
+          ctx: OpenClawPluginToolContext<2>,
+        ): void => {
+          if (typeof ctx.assertInvocationCurrent !== "function") {
+            throw new Error(
+              "Plugin tool invocation authority is unavailable outside an admitted run or request",
+            );
+          }
+          ctx.assertInvocationCurrent();
+          ctx.assertMemoryAudienceCurrent?.();
+        };
 
-          const pageTool: AnyAgentTool = {
-            name: KNOWLEDGE_PAGE_TOOL_DEFINITION.name,
-            label: KNOWLEDGE_PAGE_TOOL_DEFINITION.label,
-            description: KNOWLEDGE_PAGE_TOOL_DEFINITION.description,
-            parameters: KNOWLEDGE_PAGE_TOOL_DEFINITION.parameters,
-            async execute(_id: string, params: Record<string, unknown>) {
+        // V2 tool factory: `create(ctx)` can run during metadata-only catalog
+        // inspection when no admitted invocation is active, so live authority
+        // checks and bank resolution run inside `execute()` across initialization,
+        // SDK dispatch, and data return. (#13)
+        const factory: OpenClawPluginToolFactory<2> = {
+          contextVersion: 2,
+          create(ctx: OpenClawPluginToolContext<2>) {
+            const rawToolsByBank = new Map<
+              string,
+              Map<string, RawKnowledgeTool>
+            >();
+            const getRawToolsForBank = (bankId: string) => {
+              let byName = rawToolsByBank.get(bankId);
+              if (!byName) {
+                const rawTools = createKnowledgeTools({
+                  apiUrl,
+                  apiToken,
+                  bankId,
+                });
+                byName = new Map(rawTools.map((t) => [t.name, t]));
+                rawToolsByBank.set(bankId, byName);
+              }
+              return byName;
+            };
+
+            const executeAuthorized = async (
+              runOperation: (
+                rawToolsByName: Map<string, RawKnowledgeTool>,
+              ) => Promise<RawKnowledgeToolResult>,
+            ) => {
+              assertLiveToolAuthority(ctx);
+              const config = currentPluginConfig || pluginConfig;
+              const resolution = resolveBankIdForKnowledgeTools(ctx, config);
               if (resolution.identityError) {
                 return {
-                  content: [{ type: "text", text: resolution.identityError }],
+                  content: [
+                    { type: "text" as const, text: resolution.identityError },
+                  ],
                   details: { error: resolution.identityError },
                 };
               }
-              const config = currentPluginConfig || pluginConfig;
-              await ensureBankDefaultsApplied(resolution.bankId, config);
-              const result = await executeKnowledgePageAction(
-                rawToolsByName,
-                params,
-              );
+              await ensureBankDefaultsApplied(resolution.bankId, config, {
+                assertAuthorityCurrent: () => assertLiveToolAuthority(ctx),
+                fallbackClient: getBankDefaultsClient(),
+              });
+              assertLiveToolAuthority(ctx);
+              const rawToolsByName = getRawToolsForBank(resolution.bankId);
+              let result: RawKnowledgeToolResult;
+              try {
+                result = await runOperation(rawToolsByName);
+              } catch (err) {
+                assertLiveToolAuthority(ctx);
+                throw err;
+              }
+              assertLiveToolAuthority(ctx);
               return { ...result, details: knowledgeToolDetails(result) };
-            },
-          };
+            };
 
-          const memoryTools = rawTools
-            .filter((t) => KNOWLEDGE_TOOL_RENAMES[t.name])
-            .map((t): AnyAgentTool => {
-              const override = KNOWLEDGE_TOOL_RENAMES[t.name]!;
-              return {
-                name: override.name,
-                label: override.label ?? t.label,
-                description: override.description ?? t.description,
-                parameters: t.parameters,
-                async execute(_id: string, params: Record<string, unknown>) {
-                  if (resolution.identityError) {
-                    return {
-                      content: [
-                        { type: "text", text: resolution.identityError },
-                      ],
-                      details: { error: resolution.identityError },
-                    };
-                  }
-                  const config = currentPluginConfig || pluginConfig;
-                  await ensureBankDefaultsApplied(resolution.bankId, config);
-                  const result = await t.execute(params);
-                  return { ...result, details: knowledgeToolDetails(result) };
-                },
-              };
-            });
+            const pageTool: AnyAgentTool = {
+              name: KNOWLEDGE_PAGE_TOOL_DEFINITION.name,
+              label: KNOWLEDGE_PAGE_TOOL_DEFINITION.label,
+              description: KNOWLEDGE_PAGE_TOOL_DEFINITION.description,
+              parameters: KNOWLEDGE_PAGE_TOOL_DEFINITION.parameters,
+              async execute(_id: string, params: Record<string, unknown>) {
+                return await executeAuthorized((rawToolsByName) =>
+                  executeKnowledgePageAction(rawToolsByName, params),
+                );
+              },
+            };
 
-          return [...memoryTools, pageTool];
+            const memoryTools = catalogTools
+              .filter((t) => KNOWLEDGE_TOOL_RENAMES[t.name])
+              .map((t): AnyAgentTool => {
+                const override = KNOWLEDGE_TOOL_RENAMES[t.name]!;
+                return {
+                  name: override.name,
+                  label: override.label ?? t.label,
+                  description: override.description ?? t.description,
+                  parameters: t.parameters,
+                  async execute(_id: string, params: Record<string, unknown>) {
+                    return await executeAuthorized(async (rawToolsByName) => {
+                      const delegate = rawToolsByName.get(t.name);
+                      if (!delegate) {
+                        throw new Error(`Underlying tool ${t.name} not found`);
+                      }
+                      return await delegate.execute(params);
+                    });
+                  },
+                };
+              });
+
+            return [...memoryTools, pageTool];
+          },
         };
 
         api.registerTool(factory, {
