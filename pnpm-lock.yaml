@@ -175,21 +175,21 @@ importers:
         specifier: 0.1.1
         version: 0.1.1
       '@vectorize-io/hindsight-all':
-        specifier: 1.2.0
-        version: 1.2.0
+        specifier: 1.2.1
+        version: 1.2.1
       '@vectorize-io/hindsight-client':
-        specifier: 1.2.0
-        version: 1.2.0
+        specifier: 1.2.1
+        version: 1.2.1
       openclaw:
-        specifier: 2026.11.2
-        version: 2026.11.2
+        specifier: 2026.11.3
+        version: 2026.11.3
     devDependencies:
       '@openclaw/proxyline':
         specifier: 0.4.0
         version: 0.4.0(undici@8.12.2)
       prettier:
-        specifier: 3.9.10
-        version: 3.9.10
+        specifier: 3.10.0
+        version: 3.10.0
       typescript:
         specifier: 7.0.2
         version: 7.0.2
@@ -534,8 +534,8 @@ packages:
     resolution: {integrity: sha512-juG5VWh4qAivzTAeMzvY9xs9HY5rAcr2E4I7tiSSCokRFi7XIZCAu92ZkSTsIj1OPceCifL3cpfteP3pDT9/QQ==}
     engines: {node: '>=14.0.0'}
 
-  '@openclaw/ai@2026.11.2':
-    resolution: {integrity: sha512-ONDzpAJaw037W5aVnlQ84DKW7+gtcBLRvrlQMJxZ0i1BmBLGQfr89bcRlOs8w6pKBRy+7J3cGovSYoGXrk8CFg==}
+  '@openclaw/ai@2026.11.3':
+    resolution: {integrity: sha512-NNLfm1BSiVGfDW2M3wbTimtXQ5E4jdn87Fl+mAks9j2o4vQ1LZb86dC9K5kcKNJDciQZ0T1JlExK1rnldLU8IA==}
     engines: {node: '>=22.19.0'}
 
   '@openclaw/fs-safe-darwin-arm64@0.26.5':
@@ -1142,15 +1142,15 @@ packages:
   '@vectorize-io/hindsight-agent-sdk@0.1.1':
     resolution: {integrity: sha512-O08ZXQL65L1Dd4DHWuihaprGRkG8/YSr75dhVykyCv4UFX0C48MOCo7aRXRB2ajEPJpmIu3BGRMNKaiShf+Ppg==}
 
-  '@vectorize-io/hindsight-all@1.2.0':
-    resolution: {integrity: sha512-JqiFx7eTf33kgZ4NCj1siV1euJFYNONX1CkG2jWu1KIONLbhOKIcHlMhlLlbtar3mQB600XodzSu6Ly5CLPDMQ==}
+  '@vectorize-io/hindsight-all@1.2.1':
+    resolution: {integrity: sha512-eXggSENW5/Hefuyn0H2rJjLYjmw/nOU1VdOjUvQ+HNlG+sP/tSchk5mt55QxtKx3NJKg01cAa/BXfaBrm3pLew==}
     engines: {node: '>=22'}
 
   '@vectorize-io/hindsight-client@0.6.2':
     resolution: {integrity: sha512-bymmlMWI1z0zOjgY+wRMLudNxzqcW20VHMtyV3QLhwJm63NeQN/nEZ4plWPR0p28DffaUM5nk2VSxzQljN+Mow==}
 
-  '@vectorize-io/hindsight-client@1.2.0':
-    resolution: {integrity: sha512-4KYsxLZhe9Hqyp6EQYMMHFmQKaP+7XBwclHD2cLjuHfR/b/KJgnieMK6YYIsWEifhRSR0llv45q5xXDObjILoQ==}
+  '@vectorize-io/hindsight-client@1.2.1':
+    resolution: {integrity: sha512-Av5Dl5MqvZ1Vx+UMF1i0zVxz4BkCrhM4mg3E0hy2K7n6yUWbWz23OqFGTRAJzqtDLoFji6SmQRMj3TH2/Nig7Q==}
 
   '@vitest/mocker@5.0.5':
     resolution: {integrity: sha512-xLL3lkDegJZw+MGoGaCCsFayDZthGgpAtr3Vziyfc4p7xH89K7KRPcRBBh/kEYm0Aqkt5DtTmkYpBtRV/FrHZg==}
@@ -2059,8 +2059,8 @@ packages:
       zod:
         optional: true
 
-  openclaw@2026.11.2:
-    resolution: {integrity: sha512-SgBml4WLp8V1DdAYkrTPLzVdA/iYo3iuHCtm4788GjaG83QZdd1VeOTlue0HBJGdn3SbFE06b6uPs+AM5ShMgg==}
+  openclaw@2026.11.3:
+    resolution: {integrity: sha512-FBq/q0TCaoA2b7qfdV0q81fHhI6RBB1zAQfJQREc1u2TlK5khVgCUsAlXskLWthyVqRz5PWEj+oOmfYgK58dHg==}
     engines: {node: '>=24.16.0 <25 || >=26.1.0'}
     hasBin: true
     bundledDependencies:
@@ -2193,8 +2193,8 @@ packages:
     resolution: {integrity: sha512-9ZhXKM/rw350N1ovuWHbGxnGh/SNJ4cnxHiM0rxE4VN41wsg8P8zWn9hv/buK00RP4WvlOyr/RBDiptyxVbkZQ==}
     engines: {node: '>=0.10.0'}
 
-  prettier@3.9.10:
-    resolution: {integrity: sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==}
+  prettier@3.10.0:
+    resolution: {integrity: sha512-mBi4765LgjO1PFjlEs7pUeK0nb1bw71c+N4/ItfeUWNdY5cV2pRKaFpbbFRYmDJMO+5ZwzGxHRqHxFZna7iv5w==}
     engines: {node: '>=14'}
     hasBin: true
 
@@ -2938,7 +2938,7 @@ snapshots:
 
   '@mozilla/readability@0.6.0': {}
 
-  '@openclaw/ai@2026.11.2(@modelcontextprotocol/sdk@1.32.1(zod@4.6.5))(undici@8.12.2)(ws@8.22.0)(zod@4.6.5)':
+  '@openclaw/ai@2026.11.3(@modelcontextprotocol/sdk@1.32.1(zod@4.6.5))(undici@8.12.2)(ws@8.22.0)(zod@4.6.5)':
     dependencies:
       '@anthropic-ai/sdk': 0.131.0(zod@4.6.5)
       '@google/genai': 2.27.0(@modelcontextprotocol/sdk@1.32.1(zod@4.6.5))
@@ -3345,11 +3345,11 @@ snapshots:
     dependencies:
       '@vectorize-io/hindsight-client': 0.6.2
 
-  '@vectorize-io/hindsight-all@1.2.0': {}
+  '@vectorize-io/hindsight-all@1.2.1': {}
 
   '@vectorize-io/hindsight-client@0.6.2': {}
 
-  '@vectorize-io/hindsight-client@1.2.0': {}
+  '@vectorize-io/hindsight-client@1.2.1': {}
 
   '@vitest/mocker@5.0.5(vite@8.3.3(@types/node@26.6.2)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))':
     dependencies:
@@ -4132,7 +4132,7 @@ snapshots:
       ws: 8.22.0
       zod: 4.6.5
 
-  openclaw@2026.11.2:
+  openclaw@2026.11.3:
     dependencies:
       '@agentclientprotocol/sdk': 1.7.0(zod@4.6.5)
       '@anthropic-ai/sdk': 0.131.0(zod@4.6.5)
@@ -4149,7 +4149,7 @@ snapshots:
       '@mistralai/mistralai': 2.7.0
       '@modelcontextprotocol/sdk': 1.32.1(zod@4.6.5)
       '@mozilla/readability': 0.6.0
-      '@openclaw/ai': 2026.11.2(@modelcontextprotocol/sdk@1.32.1(zod@4.6.5))(undici@8.12.2)(ws@8.22.0)(zod@4.6.5)
+      '@openclaw/ai': 2026.11.3(@modelcontextprotocol/sdk@1.32.1(zod@4.6.5))(undici@8.12.2)(ws@8.22.0)(zod@4.6.5)
       '@openclaw/fs-safe': 0.26.5
       '@openclaw/proc-safe': 0.4.2
       '@openclaw/proxyline': 0.4.0(undici@8.12.2)
@@ -4400,7 +4400,7 @@ snapshots:
     dependencies:
       xtend: 4.0.2
 
-  prettier@3.9.10: {}
+  prettier@3.10.0: {}
 
   pretty-ms@9.3.1:
     dependencies:
