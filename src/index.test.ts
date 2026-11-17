@@ -165,6 +165,14 @@ describe("stripRuntimeEnvelope", () => {
 // ---------------------------------------------------------------------------
 
 describe("extractRecallQuery", () => {
+  it("applies a configured minimum after trimming on both input paths", () => {
+    expect(extractRecallQuery(" 好 ", undefined, 1)).toBe("好");
+    expect(extractRecallQuery(undefined, " 繼續 ", 2)).toBe("繼續");
+    expect(extractRecallQuery("四個中文字", undefined, 6)).toBeNull();
+    expect(extractRecallQuery(undefined, "四個中文字", 6)).toBeNull();
+    expect(extractRecallQuery(" ", " ", 1)).toBeNull();
+  });
+
   it("returns rawMessage when it is long enough", () => {
     expect(extractRecallQuery("What is my favorite food?", undefined)).toBe(
       "What is my favorite food?",
@@ -3131,6 +3139,27 @@ describe("getPluginConfig — debugPerfTiming flag (#1406)", () => {
       getPluginConfig(makeApi({ debugPerfTiming: 1 })).debugPerfTiming,
     ).toBe(false);
   });
+});
+
+describe("getPluginConfig — recall minimum query characters", () => {
+  it("defaults to 5 and accepts positive integers", () => {
+    expect(getPluginConfig(makeApi({})).minTriggerChars).toBe(5);
+    expect(
+      getPluginConfig(makeApi({ minTriggerChars: 1 })).minTriggerChars,
+    ).toBe(1);
+    expect(
+      getPluginConfig(makeApi({ minTriggerChars: 20 })).minTriggerChars,
+    ).toBe(20);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, "2", null])(
+    "defaults invalid value %s to 5",
+    (value) => {
+      expect(
+        getPluginConfig(makeApi({ minTriggerChars: value })).minTriggerChars,
+      ).toBe(5);
+    },
+  );
 });
 
 describe("getPluginConfig — recall injection position", () => {

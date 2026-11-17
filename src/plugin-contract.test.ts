@@ -302,6 +302,35 @@ describe("official OpenClaw plugin contracts", () => {
     },
   );
 
+  it.each([
+    [1, "好", true],
+    [2, "好", false],
+    [2, "繼續", true],
+    [1, "   ", false],
+  ] as const)(
+    "uses minTriggerChars=%s for current input %j",
+    async (minimum, input, expected) => {
+      const fixture = await register({
+        scope: { skipRetainSessions: ["**"] },
+        minTriggerChars: minimum,
+      });
+      await fixture.service.start();
+      const recall = vi
+        .spyOn(HindsightClient.prototype, "recall")
+        .mockResolvedValue({ results: [] });
+      await fixture.hook("before_prompt_build")(
+        {
+          currentUserMessage: input,
+          prompt: "A longer historical prompt must not bypass the minimum.",
+          messages,
+        },
+        agentContext,
+      );
+      expect(recall).toHaveBeenCalledTimes(expected ? 1 : 0);
+      if (expected) expect(recall.mock.calls[0][1]).toBe(input);
+    },
+  );
+
   it("treats an explicitly empty currentUserMessage as a non-text request", async () => {
     const fixture = await register({ scope: { skipRetainSessions: ["**"] } });
     await fixture.service.start();
