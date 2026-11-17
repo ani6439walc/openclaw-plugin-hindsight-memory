@@ -302,6 +302,12 @@
         "description": "Number of user turns to include in recall query context. 1 keeps latest-message-only behavior.",
         "default": 1
       },
+      "minTriggerChars": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Minimum cleaned current query length in UTF-16 code units for automatic recall, before adding conversation context. Empty and operational inputs remain excluded.",
+        "default": 5
+      },
       "recallMaxQueryChars": {
         "type": "integer",
         "minimum": 1,
@@ -550,6 +556,10 @@
     "recallContextTurns": {
       "label": "Recall Context Turns",
       "placeholder": "1 (latest only, default)"
+    },
+    "minTriggerChars": {
+      "label": "Minimum Trigger Characters",
+      "placeholder": "5 (default)"
     },
     "recallMaxQueryChars": {
       "label": "Recall Max Query Chars",

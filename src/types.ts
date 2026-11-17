@@ -143,6 +143,7 @@ export interface PluginConfig {
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)
   recallTimeoutMs?: number; // Timeout for auto-recall in milliseconds. Default: 10000
+  minTriggerChars?: number; // Minimum cleaned current query length in UTF-16 code units. Positive integer; default: 5
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'user' = before user message (default, preserves system prompt cache), 'prepend' = start of system prompt, 'append' = end of system prompt.

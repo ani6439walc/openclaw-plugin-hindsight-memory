@@ -1741,11 +1741,12 @@ export function stripRuntimeEnvelope(content: string): string {
  * Prefers the current request. Falls back to the legacy prompt, stripping
  * envelope formatting (System: lines, [Channel ...] headers, [from: X] footers).
  *
- * Returns null when no usable query (< 5 chars) can be extracted.
+ * Returns null when no usable query meets minQueryChars (UTF-16 code units).
  */
 export function extractRecallQuery(
   currentRequest: string | undefined,
   prompt: string | undefined,
+  minQueryChars = 5,
 ): string | null {
   // Reject known metadata/system message patterns — these are not user queries
   const METADATA_PATTERNS = [
@@ -1772,7 +1773,7 @@ export function extractRecallQuery(
   if (
     !recallQuery ||
     typeof recallQuery !== "string" ||
-    recallQuery.trim().length < 5 ||
+    recallQuery.trim().length < minQueryChars ||
     isMetadata(recallQuery) ||
     isEphemeralOperationalText(recallQuery)
   ) {
@@ -1785,7 +1786,7 @@ export function extractRecallQuery(
         ),
       );
     }
-    if (!recallQuery || recallQuery.length < 5) {
+    if (!recallQuery || recallQuery.length < minQueryChars) {
       return null;
     }
 
@@ -1827,7 +1828,7 @@ export function extractRecallQuery(
 
   const trimmed = recallQuery.trim();
   if (
-    trimmed.length < 5 ||
+    trimmed.length < minQueryChars ||
     isMetadata(trimmed) ||
     isEphemeralOperationalText(trimmed)
   ) {
@@ -3624,6 +3625,12 @@ export function getPluginConfig(
       config.recallContextTurns >= 1
         ? config.recallContextTurns
         : 1,
+    minTriggerChars:
+      typeof config.minTriggerChars === "number" &&
+      Number.isInteger(config.minTriggerChars) &&
+      config.minTriggerChars >= 1
+        ? config.minTriggerChars
+        : 5,
     recallMaxQueryChars:
       typeof config.recallMaxQueryChars === "number" &&
       config.recallMaxQueryChars >= 1
@@ -4116,6 +4123,7 @@ function registerPlugin(api: OpenClawPluginApi) {
         const extracted = extractRecallQuery(
           currentRequest,
           currentRequest === undefined ? event.prompt : undefined,
+          pluginConfig.minTriggerChars,
         );
         if (!extracted) {
           debug(
