@@ -514,11 +514,3 @@ Resume still skips only completed checkpoint entries. Entries previously enqueue
 ## License
 
 MIT
-
-### Jules PR review
-
-The Jules review workflow follows skill-harness. Connect this repository to Jules
-and configure the `JULES_API_KEY` GitHub Actions secret. Reviews run for pull
-requests opened by the owner or trusted collaborators; GitHub supplies
-`GITHUB_TOKEN` automatically. Large diffs use a temporary branch that the workflow
-cleans up after review.
