@@ -210,4 +210,69 @@ describe("backfill planning", () => {
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0].sessionId).toBe("live");
   });
+
+  it("resolves env SecretRefs from caller env and <openclawRoot>/.env", () => {
+    const root = makeTempRoot();
+    writeOpenClawConfig(root, {
+      plugins: {
+        entries: {
+          "hindsight-memory": {
+            config: {
+              hindsightApiUrl: "https://hindsight.example.test",
+              hindsightApiToken: {
+                source: "env",
+                provider: "default",
+                id: "HINDSIGHT_API_TOKEN",
+              },
+              llmApiKey: {
+                source: "env",
+                provider: "default",
+                id: "OPENAI_API_KEY",
+              },
+            },
+          },
+        },
+      },
+    });
+    writeFileSync(
+      join(root, ".env"),
+      "HINDSIGHT_API_TOKEN=token-from-dotenv\nOPENAI_API_KEY=key-from-dotenv\n",
+      "utf8",
+    );
+
+    const fromDotEnv = loadPluginConfigFromOpenClawRoot(root, {});
+    expect(fromDotEnv.hindsightApiToken).toBe("token-from-dotenv");
+    expect(fromDotEnv.llmApiKey).toBe("key-from-dotenv");
+
+    const fromCallerEnv = loadPluginConfigFromOpenClawRoot(root, {
+      HINDSIGHT_API_TOKEN: "token-from-env",
+    });
+    expect(fromCallerEnv.hindsightApiToken).toBe("token-from-env");
+    expect(fromCallerEnv.llmApiKey).toBe("key-from-dotenv");
+  });
+
+  it("keeps unresolved SecretRefs non-fatal when loading config for planning", () => {
+    const root = makeTempRoot();
+    const unresolvedRef = {
+      source: "env",
+      provider: "default",
+      id: "MISSING_HINDSIGHT_API_TOKEN",
+    };
+    writeOpenClawConfig(root, {
+      plugins: {
+        entries: {
+          "hindsight-memory": {
+            config: {
+              bankId: "plan-bank",
+              hindsightApiToken: unresolvedRef,
+            },
+          },
+        },
+      },
+    });
+
+    const config = loadPluginConfigFromOpenClawRoot(root, {});
+    expect(config.bankId).toBe("plan-bank");
+    expect(config.hindsightApiToken).toEqual(unresolvedRef);
+  });
 });

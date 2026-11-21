@@ -3,6 +3,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { PluginConfig } from "./types.js";
+import type { BackfillSecretField } from "./backfill-secrets.js";
 
 export interface SqliteBackfillSource {
   kind: "sqlite";
@@ -22,6 +23,7 @@ export type BackfillUnavailable = {
 
 export interface BackfillSourceReader {
   prepare(): Promise<{ pluginConfig: PluginConfig; agentIds: string[] }>;
+  resolveSecret?(field: BackfillSecretField): Promise<string | undefined>;
   discover(
     agentId: string,
     includeRetained: boolean,
@@ -44,6 +46,7 @@ export interface BackfillSnapshotReader extends BackfillSourceReader {
 
 type BackfillWorkerOperation =
   | { operation: "prepare" }
+  | { operation: "resolve-secret"; field: BackfillSecretField }
   | { operation: "select-store"; agentId: string; expectedPhysical: string }
   | { operation: "discover"; agentId: string; includeRetained: boolean }
   | { operation: "read"; source: SqliteBackfillSource }
@@ -260,6 +263,7 @@ function createReader(
 
   return {
     prepare: () => call({ operation: "prepare" }),
+    resolveSecret: (field) => call({ operation: "resolve-secret", field }),
     selectStore: (agentId, expectedPhysical) =>
       call({ operation: "select-store", agentId, expectedPhysical }),
     discover: (agentId, includeRetained) =>

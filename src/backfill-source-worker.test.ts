@@ -504,4 +504,92 @@ describe("isolated stock snapshot reader", () => {
     expect(f.get).not.toHaveBeenCalled();
     await f.service.close();
   });
+
+  it("refuses secret resolution in snapshot reader mode", async () => {
+    const f = await fixture(true);
+    await expect(
+      f.service.resolveSecret?.("hindsightApiToken"),
+    ).rejects.toThrow(/Invalid backfill secret resolution operation/);
+    await f.service.close();
+  });
+});
+
+describe("stock backfill worker secret resolution", () => {
+  it("resolves plugin SecretRefs via OpenClaw secret-input-runtime with <stateDir>/.env fallback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hindsight-worker-secret-"));
+    roots.push(root);
+    await writeFile(
+      join(root, ".env"),
+      "HINDSIGHT_API_TOKEN=token-from-state-dotenv\nUNRELATED_KEY=must-not-leak\n",
+      "utf8",
+    );
+    const tokenRef = {
+      source: "env",
+      provider: "default",
+      id: "HINDSIGHT_API_TOKEN",
+    };
+    const config = {
+      agents: { ownership: "explicit", entries: { main: {} } },
+      plugins: {
+        entries: {
+          "hindsight-memory": {
+            config: {
+              hindsightApiUrl: "https://hindsight.example.test",
+              hindsightApiToken: tokenRef,
+            },
+          },
+        },
+      },
+    };
+    const resolveConfiguredSecretInputString = vi.fn(
+      async (params: {
+        env: NodeJS.ProcessEnv;
+        value: unknown;
+        path: string;
+      }) => {
+        expect(params.path).toBe(
+          "plugins.entries.hindsight-memory.config.hindsightApiToken",
+        );
+        expect(params.value).toEqual(tokenRef);
+        expect(params.env.UNRELATED_KEY).toBeUndefined();
+        return { value: params.env.HINDSIGHT_API_TOKEN };
+      },
+    );
+    const loadModule = vi.fn(async (specifier: string): Promise<unknown> => {
+      switch (specifier) {
+        case "openclaw/plugin-sdk/health":
+          return {
+            readConfigFileSnapshot: async () => ({
+              exists: true,
+              valid: true,
+              config,
+            }),
+          };
+        case "openclaw/plugin-sdk/agent-scope-runtime":
+          return { listAgentIds: () => ["main"] };
+        case "openclaw/plugin-sdk/secret-input-runtime":
+          return { resolveConfiguredSecretInputString };
+        default:
+          throw new Error(`Unexpected module ${specifier}`);
+      }
+    });
+
+    const service = createBackfillWorkerService(loadModule, {
+      OPENCLAW_STATE_DIR: root,
+      OPENCLAW_CONFIG_PATH: join(root, "openclaw.json"),
+    });
+    expect(await service.resolveSecret?.("hindsightApiToken")).toBe(
+      "token-from-state-dotenv",
+    );
+    expect(resolveConfiguredSecretInputString).toHaveBeenCalledOnce();
+
+    resolveConfiguredSecretInputString.mockResolvedValueOnce({
+      unresolvedRefReason:
+        "plugins.entries.hindsight-memory.config.hindsightApiToken SecretRef is unresolved (env:default:HINDSIGHT_API_TOKEN).",
+    } as unknown as { value: string | undefined });
+    await expect(service.resolveSecret?.("hindsightApiToken")).rejects.toThrow(
+      /SecretRef is unresolved/,
+    );
+    await service.close();
+  });
 });

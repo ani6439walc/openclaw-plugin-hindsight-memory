@@ -40,6 +40,12 @@ import {
   createBackfillSourceReader,
   type BackfillSourceReader,
 } from "./backfill-source.js";
+import {
+  mergeOpenClawRootDotEnv,
+  parseSecretRef,
+  resolveEnvSecretRefFromConfig,
+  type BackfillSecretField,
+} from "./backfill-secrets.js";
 
 interface ParsedArgs {
   openclawRoot: string;
@@ -205,17 +211,61 @@ function parseArgs(argv: string[]): ParsedArgs {
   return args;
 }
 
-function inferApiSettings(
+export interface BackfillRuntimeSecretOptions {
+  openclawRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  resolveSecret?: (field: BackfillSecretField) => Promise<string | undefined>;
+}
+
+async function resolveBackfillSecretField(
+  pluginConfig: PluginConfig,
+  field: BackfillSecretField,
+  options: BackfillRuntimeSecretOptions,
+): Promise<string | undefined> {
+  const rawValue = (pluginConfig as Record<string, unknown>)[field];
+  if (rawValue === undefined || rawValue === null) {
+    return undefined;
+  }
+  if (typeof rawValue === "string") {
+    return rawValue || undefined;
+  }
+  if (options.resolveSecret) {
+    return await options.resolveSecret(field);
+  }
+  const parsedRef = parseSecretRef(rawValue);
+  const effectiveEnv =
+    parsedRef?.source === "env"
+      ? mergeOpenClawRootDotEnv(
+          options.openclawRoot,
+          options.env ?? process.env,
+          [parsedRef.id],
+        )
+      : { ...(options.env ?? process.env) };
+  const result = resolveEnvSecretRefFromConfig(
+    rawValue,
+    undefined,
+    effectiveEnv,
+  );
+  if (result.status === "resolved") {
+    return result.value;
+  }
+  if (result.status === "absent") {
+    return undefined;
+  }
+  throw new Error(
+    `Failed to resolve plugins.entries.hindsight-memory.config.${field}: ${result.reason}`,
+  );
+}
+
+function inferApiUrl(
   pluginConfig: PluginConfig,
   explicitApiUrl?: string,
-  explicitApiToken?: string,
-): { apiUrl: string; apiToken?: string } {
-  const apiUrl =
+): string {
+  return (
     explicitApiUrl ||
     pluginConfig.hindsightApiUrl ||
-    `http://127.0.0.1:${pluginConfig.apiPort || 9077}`;
-  const apiToken = explicitApiToken || pluginConfig.hindsightApiToken;
-  return { apiUrl, apiToken: apiToken || undefined };
+    `http://127.0.0.1:${pluginConfig.apiPort || 9077}`
+  );
 }
 
 async function checkHealth(
@@ -322,12 +372,16 @@ export async function createBackfillRuntime(
   pluginConfig: PluginConfig,
   explicitApiUrl?: string,
   explicitApiToken?: string,
+  options: BackfillRuntimeSecretOptions = {},
 ): Promise<BackfillRuntime> {
-  const explicit = inferApiSettings(
-    pluginConfig,
-    explicitApiUrl,
-    explicitApiToken,
-  );
+  const apiUrl = inferApiUrl(pluginConfig, explicitApiUrl);
+  const apiToken =
+    explicitApiToken ||
+    (await resolveBackfillSecretField(
+      pluginConfig,
+      "hindsightApiToken",
+      options,
+    ));
   const externalApi = detectExternalApi(pluginConfig);
   const useExternalApi = !!(
     explicitApiUrl ||
@@ -338,21 +392,30 @@ export async function createBackfillRuntime(
 
   if (useExternalApi) {
     return {
-      apiUrl: explicit.apiUrl,
-      apiToken: explicit.apiToken,
+      apiUrl,
+      apiToken,
       async stop() {},
     };
   }
 
-  if (await checkHealth(explicit.apiUrl, explicit.apiToken)) {
+  if (await checkHealth(apiUrl, apiToken)) {
     return {
-      apiUrl: explicit.apiUrl,
-      apiToken: explicit.apiToken,
+      apiUrl,
+      apiToken,
       async stop() {},
     };
   }
 
-  const llmConfig = detectLLMConfig(pluginConfig);
+  const resolvedLlmApiKey = await resolveBackfillSecretField(
+    pluginConfig,
+    "llmApiKey",
+    options,
+  );
+  const resolvedPluginConfig: PluginConfig =
+    pluginConfig.llmApiKey !== undefined
+      ? { ...pluginConfig, llmApiKey: resolvedLlmApiKey }
+      : pluginConfig;
+  const llmConfig = detectLLMConfig(resolvedPluginConfig);
   const manager = new HindsightServer({
     profile: "openclaw",
     port: pluginConfig.apiPort || 9077,
@@ -556,6 +619,12 @@ async function runBackfill(
     pluginConfig,
     args.apiUrl,
     args.apiToken,
+    {
+      openclawRoot: args.openclawRoot,
+      resolveSecret: sourceReader.resolveSecret
+        ? (field) => sourceReader.resolveSecret!(field)
+        : undefined,
+    },
   );
   // Single shared client — hindsight-client takes bankId as a parameter on
   // every call, so there's no reason to cache per-bank clients anymore.

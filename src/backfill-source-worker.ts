@@ -26,6 +26,11 @@ import {
   BackfillProjectionError,
   type BackfillProjectionHost,
 } from "./backfill-projection.js";
+import {
+  isBackfillSecretField,
+  mergeOpenClawRootDotEnv,
+  parseSecretRef,
+} from "./backfill-secrets.js";
 import type { PluginConfig } from "./types.js";
 
 type ModuleLoader = (specifier: string) => Promise<unknown>;
@@ -427,6 +432,60 @@ export function createBackfillWorkerService(
       const { pluginConfig, agentIds } = await prepare();
       return { pluginConfig, agentIds };
     },
+    async resolveSecret(field) {
+      if (snapshotMode) {
+        throw new BackfillHostError(
+          "Invalid backfill secret resolution operation",
+        );
+      }
+      if (!isBackfillSecretField(field)) {
+        throw new BackfillHostError("Invalid backfill secret field");
+      }
+      const { config, pluginConfig } = await prepare();
+      const rawValue = (pluginConfig as Record<string, unknown>)[field];
+      if (rawValue === undefined || rawValue === null) return undefined;
+      if (typeof rawValue === "string") return rawValue || undefined;
+      const secretRuntime = await publicModule(
+        "openclaw/plugin-sdk/secret-input-runtime",
+      );
+      if (
+        typeof secretRuntime.resolveConfiguredSecretInputString !== "function"
+      ) {
+        throw new BackfillHostError(
+          "Unsupported OpenClaw host: missing public secret input resolver",
+        );
+      }
+      const parsedRef = parseSecretRef(rawValue);
+      const effectiveEnv =
+        parsedRef?.source === "env"
+          ? mergeOpenClawRootDotEnv(env.OPENCLAW_STATE_DIR, env, [parsedRef.id])
+          : { ...env };
+      const resolved: unknown =
+        await secretRuntime.resolveConfiguredSecretInputString({
+          config,
+          env: effectiveEnv,
+          value: rawValue,
+          path: `plugins.entries.hindsight-memory.config.${field}`,
+          unresolvedReasonStyle: "detailed",
+        });
+      if (!object(resolved)) {
+        throw new BackfillHostError(
+          "Invalid OpenClaw secret input resolution response",
+        );
+      }
+      if (
+        typeof resolved.unresolvedRefReason === "string" &&
+        resolved.unresolvedRefReason.trim().length > 0
+      ) {
+        throw new BackfillHostError(resolved.unresolvedRefReason);
+      }
+      if (typeof resolved.value === "string" && resolved.value.length > 0) {
+        return resolved.value;
+      }
+      throw new BackfillHostError(
+        `Selected Hindsight plugin config ${field} is invalid: expected string or SecretRef`,
+      );
+    },
     async discover(agentId, includeRetained) {
       if (!identity(agentId))
         throw new BackfillHostError("Invalid backfill agent identity");
@@ -543,6 +602,13 @@ function startWorker(): void {
         switch (request.operation) {
           case "prepare":
             value = await service.prepare();
+            break;
+          case "resolve-secret":
+            if (!isBackfillSecretField(request.field))
+              throw new BackfillHostError(
+                "Invalid backfill secret resolution request",
+              );
+            value = await service.resolveSecret?.(request.field);
             break;
           case "select-store":
             if (

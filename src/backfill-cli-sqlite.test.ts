@@ -21,8 +21,8 @@ const calls = vi.hoisted(() => ({
 }));
 vi.mock("@vectorize-io/hindsight-client", () => ({
   HindsightClient: class {
-    constructor() {
-      calls.client();
+    constructor(options?: unknown) {
+      calls.client(options);
     }
     retain = calls.retain;
   },
@@ -247,5 +247,41 @@ describe("SQLite backfill CLI boundary", () => {
     );
     expect(calls.retain).not.toHaveBeenCalled();
     expect(reader.close).toHaveBeenCalledOnce();
+  });
+
+  it("skips SecretRef resolution during --dry-run and resolves hindsightApiToken during live run", async () => {
+    const { root, reader } = fixture();
+    const resolveSecret = vi.fn(async () => "resolved-secret-token");
+    reader.prepare.mockResolvedValue({
+      pluginConfig: {
+        dynamicBankId: false,
+        bankId: "prepared-bank",
+        hindsightApiUrl: "http://fake-hindsight.invalid",
+        hindsightApiToken: {
+          source: "env",
+          provider: "default",
+          id: "HINDSIGHT_API_TOKEN",
+        } as unknown as string,
+      },
+      agentIds: ["main"],
+    });
+    const secretReader: BackfillSourceReader = { ...reader, resolveSecret };
+
+    await runCli(
+      ["--openclaw-root", root, "--include-retained-sqlite", "--dry-run"],
+      { createSourceReader: () => secretReader },
+    );
+    expect(resolveSecret).not.toHaveBeenCalled();
+    expect(calls.client).not.toHaveBeenCalled();
+
+    await runCli(["--openclaw-root", root, "--include-retained-sqlite"], {
+      createSourceReader: () => secretReader,
+    });
+    expect(resolveSecret).toHaveBeenCalledExactlyOnceWith("hindsightApiToken");
+    expect(calls.client).toHaveBeenCalledWith({
+      baseUrl: "http://fake-hindsight.invalid",
+      apiKey: "resolved-secret-token",
+    });
+    expect(calls.retain).toHaveBeenCalledOnce();
   });
 });
