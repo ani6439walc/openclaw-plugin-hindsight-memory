@@ -307,4 +307,38 @@ describe("backfill source reader transport", () => {
     child.emit("exit", 0, null);
     await reader.close();
   });
+
+  it("forwards resolveSecret requests over IPC", async () => {
+    const child = new SyntheticWorker();
+    const sent: Array<{ id: number; operation: string; field?: string }> = [];
+    child.send = (request, callback) => {
+      sent.push(request as { id: number; operation: string; field?: string });
+      callback?.(null);
+      queueMicrotask(() => {
+        const value =
+          request.operation === "resolve-secret"
+            ? "resolved-ipc-token"
+            : undefined;
+        child.emit("message", { id: request.id, ok: true, value });
+        if (request.operation === "close") {
+          child.connected = false;
+          child.exitCode = 0;
+          child.emit("exit", 0, null);
+        }
+      });
+      return true;
+    };
+    vi.mocked(fork).mockReturnValue(
+      child as unknown as ReturnType<typeof fork>,
+    );
+    const reader = createBackfillSourceReader("/synthetic/root");
+    expect(await reader.resolveSecret?.("hindsightApiToken")).toBe(
+      "resolved-ipc-token",
+    );
+    await reader.close();
+    expect(sent[0]).toMatchObject({
+      operation: "resolve-secret",
+      field: "hindsightApiToken",
+    });
+  });
 });

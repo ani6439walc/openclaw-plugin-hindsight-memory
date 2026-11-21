@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, symlinkSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { pathToFileURL } from "url";
@@ -232,5 +232,164 @@ describe("backfill helpers", () => {
     expect(isDirectExecution(join(dir, "other-entrypoint"), moduleUrl)).toBe(
       false,
     );
+  });
+
+  it("resolves hindsightApiToken SecretRef via resolveSecret callback and .env fallback", async () => {
+    const { createBackfillRuntime } = await import("./backfill.js");
+    const secretRef = {
+      source: "env",
+      provider: "default",
+      id: "HINDSIGHT_API_TOKEN",
+    };
+    const pluginConfig = {
+      hindsightApiUrl: "https://hindsight.example.test",
+      hindsightApiToken: secretRef as unknown as string,
+    } satisfies PluginConfig;
+
+    const resolveSecret = vi.fn(async () => "host-resolved-token");
+    const viaHost = await createBackfillRuntime(
+      pluginConfig,
+      undefined,
+      undefined,
+      { resolveSecret },
+    );
+    expect(resolveSecret).toHaveBeenCalledWith("hindsightApiToken");
+    expect(viaHost.apiToken).toBe("host-resolved-token");
+
+    const root = mkdtempSync(join(tmpdir(), "hindsight-backfill-dotenv-"));
+    writeFileSync(
+      join(root, ".env"),
+      "HINDSIGHT_API_TOKEN=dotenv-resolved-token\n",
+      "utf8",
+    );
+    const viaDotEnv = await createBackfillRuntime(
+      pluginConfig,
+      undefined,
+      undefined,
+      { openclawRoot: root, env: {} },
+    );
+    expect(viaDotEnv.apiToken).toBe("dotenv-resolved-token");
+
+    const overridden = await createBackfillRuntime(
+      pluginConfig,
+      undefined,
+      "explicit-cli-token",
+      {
+        resolveSecret: vi.fn(async () => {
+          throw new Error("should not resolve when --api-token is given");
+        }),
+      },
+    );
+    expect(overridden.apiToken).toBe("explicit-cli-token");
+  });
+
+  it("fails closed when hindsightApiToken SecretRef cannot be resolved", async () => {
+    const { createBackfillRuntime } = await import("./backfill.js");
+    const pluginConfig = {
+      hindsightApiUrl: "https://hindsight.example.test",
+      hindsightApiToken: {
+        source: "env",
+        provider: "default",
+        id: "UNSET_HINDSIGHT_API_TOKEN",
+      } as unknown as string,
+    } satisfies PluginConfig;
+
+    await expect(
+      createBackfillRuntime(pluginConfig, undefined, undefined, { env: {} }),
+    ).rejects.toThrow(/UNSET_HINDSIGHT_API_TOKEN/);
+  });
+
+  it("resolves llmApiKey SecretRef before starting the local daemon", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const { HindsightServer } = await import("@vectorize-io/hindsight-all");
+    const serverSpy = vi.mocked(HindsightServer);
+    serverSpy.mockClear();
+
+    const { createBackfillRuntime } = await import("./backfill.js");
+    const pluginConfig = {
+      apiPort: 9077,
+      llmProvider: "openai",
+      llmModel: "gpt-4o-mini",
+      llmApiKey: {
+        source: "env",
+        provider: "default",
+        id: "OPENAI_API_KEY",
+      } as unknown as string,
+    } satisfies PluginConfig;
+
+    const runtime = await createBackfillRuntime(
+      pluginConfig,
+      undefined,
+      undefined,
+      {
+        resolveSecret: vi.fn(async (field) =>
+          field === "llmApiKey" ? "sk-resolved-llm-key" : undefined,
+        ),
+      },
+    );
+    expect(serverSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          HINDSIGHT_API_LLM_API_KEY: "sk-resolved-llm-key",
+        }),
+      }),
+    );
+    await runtime.stop();
+  });
+
+  it("enforces secrets.defaults and provider allowlists on the offline fallback path", async () => {
+    const { createBackfillRuntime } = await import("./backfill.js");
+    const root = mkdtempSync(join(tmpdir(), "hindsight-backfill-allowlist-"));
+    try {
+      writeFileSync(
+        join(root, "openclaw.json"),
+        JSON.stringify({
+          secrets: {
+            defaults: { env: "restricted" },
+            providers: {
+              restricted: { source: "env", allowlist: ["ALLOWED_TOKEN"] },
+            },
+          },
+        }),
+        "utf8",
+      );
+      writeFileSync(
+        join(root, ".env"),
+        "ALLOWED_TOKEN=ok-tok\nBLOCKED_TOKEN=nope-tok\n",
+        "utf8",
+      );
+
+      const blockedConfig = {
+        hindsightApiUrl: "https://hindsight.example.test",
+        hindsightApiToken: {
+          source: "env",
+          id: "BLOCKED_TOKEN",
+        } as unknown as string,
+      } satisfies PluginConfig;
+      await expect(
+        createBackfillRuntime(blockedConfig, undefined, undefined, {
+          openclawRoot: root,
+          env: {},
+        }),
+      ).rejects.toThrow(/not allowlisted/);
+
+      const allowedConfig = {
+        hindsightApiUrl: "https://hindsight.example.test",
+        hindsightApiToken: {
+          source: "env",
+          id: "ALLOWED_TOKEN",
+        } as unknown as string,
+      } satisfies PluginConfig;
+      const runtime = await createBackfillRuntime(
+        allowedConfig,
+        undefined,
+        undefined,
+        { openclawRoot: root, env: {} },
+      );
+      expect(runtime.apiToken).toBe("ok-tok");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

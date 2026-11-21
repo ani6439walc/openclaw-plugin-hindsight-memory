@@ -24,6 +24,13 @@ import type {
   BackfillSourceReader,
   SqliteBackfillSource,
 } from "./backfill-source.js";
+import {
+  BACKFILL_SECRET_FIELDS,
+  mergeOpenClawRootDotEnv,
+  parseSecretRef,
+  resolveEnvSecretRefFromConfig,
+  type OpenClawSecretsConfig,
+} from "./backfill-secrets.js";
 
 // Re-exported: these used to live here and callers import them from this module.
 export { parseSessionFile };
@@ -105,14 +112,41 @@ export function defaultCheckpointPath(openclawRoot: string): string {
 
 export function loadPluginConfigFromOpenClawRoot(
   openclawRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
 ): PluginConfig {
   const configPath = join(openclawRoot, "openclaw.json");
   const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
-    plugins?: { entries?: Record<string, { config?: PluginConfig }> };
+    secrets?: OpenClawSecretsConfig;
+    plugins?: {
+      entries?: Record<string, { config?: Record<string, unknown> }>;
+    };
   };
-  return withBackfillConfigDefaults(
-    raw.plugins?.entries?.["hindsight-memory"]?.config || {},
+  const rawPluginConfig =
+    raw.plugins?.entries?.["hindsight-memory"]?.config || {};
+  const referencedEnvKeys = BACKFILL_SECRET_FIELDS.flatMap((field) => {
+    const ref = parseSecretRef(rawPluginConfig[field]);
+    return ref?.source === "env" ? [ref.id] : [];
+  });
+  const effectiveEnv = mergeOpenClawRootDotEnv(
+    openclawRoot,
+    env,
+    referencedEnvKeys,
   );
+  const resolvedConfig: Record<string, unknown> = { ...rawPluginConfig };
+  for (const field of BACKFILL_SECRET_FIELDS) {
+    if (!(field in resolvedConfig)) continue;
+    const rawValue = resolvedConfig[field];
+    if (typeof rawValue === "string") continue;
+    const result = resolveEnvSecretRefFromConfig(
+      rawValue,
+      raw.secrets,
+      effectiveEnv,
+    );
+    if (result.status === "resolved") {
+      resolvedConfig[field] = result.value;
+    }
+  }
+  return withBackfillConfigDefaults(resolvedConfig as PluginConfig);
 }
 
 function sessionDirectories(
