@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  loadSecretsConfigFromOpenClawRoot,
   mergeOpenClawRootDotEnv,
   parseDotEnvContent,
   parseSecretRef,
@@ -145,5 +146,35 @@ describe("backfill SecretRef and .env helpers", () => {
     ).toMatchObject({
       status: "invalid",
     });
+  });
+
+  it("loads secrets config from <openclawRoot>/openclaw.json and fails closed on invalid JSON", () => {
+    const emptyRoot = makeTempRoot();
+    expect(loadSecretsConfigFromOpenClawRoot(emptyRoot)).toBeUndefined();
+    expect(loadSecretsConfigFromOpenClawRoot(undefined)).toBeUndefined();
+
+    const validRoot = makeTempRoot();
+    writeFileSync(
+      join(validRoot, "openclaw.json"),
+      JSON.stringify({
+        secrets: {
+          defaults: { env: "restricted" },
+          providers: {
+            restricted: { source: "env", allowlist: ["ALLOWED_TOKEN"] },
+          },
+        },
+      }),
+      "utf8",
+    );
+    expect(loadSecretsConfigFromOpenClawRoot(validRoot)).toEqual({
+      defaults: { env: "restricted" },
+      providers: {
+        restricted: { source: "env", allowlist: ["ALLOWED_TOKEN"] },
+      },
+    });
+
+    const corruptRoot = makeTempRoot();
+    writeFileSync(join(corruptRoot, "openclaw.json"), "{invalid json", "utf8");
+    expect(() => loadSecretsConfigFromOpenClawRoot(corruptRoot)).toThrow();
   });
 });

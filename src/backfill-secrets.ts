@@ -202,6 +202,26 @@ export function mergeOpenClawRootDotEnv(
   return merged;
 }
 
+export function loadSecretsConfigFromOpenClawRoot(
+  openclawRoot: string | undefined,
+): OpenClawSecretsConfig | undefined {
+  if (!openclawRoot || !openclawRoot.trim()) return undefined;
+  const configPath = join(openclawRoot, "openclaw.json");
+  let content: string;
+  try {
+    content = readFileSync(configPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+  const raw = JSON.parse(content) as { secrets?: unknown };
+  return isPlainRecord(raw?.secrets)
+    ? (raw.secrets as OpenClawSecretsConfig)
+    : undefined;
+}
+
 export function resolveEnvSecretRefFromConfig(
   value: unknown,
   secretsConfig?: OpenClawSecretsConfig,

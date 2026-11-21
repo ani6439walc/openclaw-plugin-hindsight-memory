@@ -41,10 +41,12 @@ import {
   type BackfillSourceReader,
 } from "./backfill-source.js";
 import {
+  loadSecretsConfigFromOpenClawRoot,
   mergeOpenClawRootDotEnv,
   parseSecretRef,
   resolveEnvSecretRefFromConfig,
   type BackfillSecretField,
+  type OpenClawSecretsConfig,
 } from "./backfill-secrets.js";
 
 interface ParsedArgs {
@@ -214,6 +216,7 @@ function parseArgs(argv: string[]): ParsedArgs {
 export interface BackfillRuntimeSecretOptions {
   openclawRoot?: string;
   env?: NodeJS.ProcessEnv;
+  secretsConfig?: OpenClawSecretsConfig;
   resolveSecret?: (field: BackfillSecretField) => Promise<string | undefined>;
 }
 
@@ -233,6 +236,11 @@ async function resolveBackfillSecretField(
     return await options.resolveSecret(field);
   }
   const parsedRef = parseSecretRef(rawValue);
+  const secretsConfig =
+    parsedRef?.source === "env"
+      ? (options.secretsConfig ??
+        loadSecretsConfigFromOpenClawRoot(options.openclawRoot))
+      : undefined;
   const effectiveEnv =
     parsedRef?.source === "env"
       ? mergeOpenClawRootDotEnv(
@@ -243,7 +251,7 @@ async function resolveBackfillSecretField(
       : { ...(options.env ?? process.env) };
   const result = resolveEnvSecretRefFromConfig(
     rawValue,
-    undefined,
+    secretsConfig,
     effectiveEnv,
   );
   if (result.status === "resolved") {

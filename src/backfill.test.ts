@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, symlinkSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { pathToFileURL } from "url";
@@ -336,5 +336,60 @@ describe("backfill helpers", () => {
       }),
     );
     await runtime.stop();
+  });
+
+  it("enforces secrets.defaults and provider allowlists on the offline fallback path", async () => {
+    const { createBackfillRuntime } = await import("./backfill.js");
+    const root = mkdtempSync(join(tmpdir(), "hindsight-backfill-allowlist-"));
+    try {
+      writeFileSync(
+        join(root, "openclaw.json"),
+        JSON.stringify({
+          secrets: {
+            defaults: { env: "restricted" },
+            providers: {
+              restricted: { source: "env", allowlist: ["ALLOWED_TOKEN"] },
+            },
+          },
+        }),
+        "utf8",
+      );
+      writeFileSync(
+        join(root, ".env"),
+        "ALLOWED_TOKEN=ok-tok\nBLOCKED_TOKEN=nope-tok\n",
+        "utf8",
+      );
+
+      const blockedConfig = {
+        hindsightApiUrl: "https://hindsight.example.test",
+        hindsightApiToken: {
+          source: "env",
+          id: "BLOCKED_TOKEN",
+        } as unknown as string,
+      } satisfies PluginConfig;
+      await expect(
+        createBackfillRuntime(blockedConfig, undefined, undefined, {
+          openclawRoot: root,
+          env: {},
+        }),
+      ).rejects.toThrow(/not allowlisted/);
+
+      const allowedConfig = {
+        hindsightApiUrl: "https://hindsight.example.test",
+        hindsightApiToken: {
+          source: "env",
+          id: "ALLOWED_TOKEN",
+        } as unknown as string,
+      } satisfies PluginConfig;
+      const runtime = await createBackfillRuntime(
+        allowedConfig,
+        undefined,
+        undefined,
+        { openclawRoot: root, env: {} },
+      );
+      expect(runtime.apiToken).toBe("ok-tok");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
